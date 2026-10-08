@@ -15,6 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,10 +25,11 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-      - uses: extractions/setup-just@v2
-      - run: just install
-      - run: just lint
-      - run: just test
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest -m "not live"
 
   live:
     name: Live tests (nomad-lab.eu)
@@ -41,6 +44,5 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-      - uses: extractions/setup-just@v2
-      - run: just install
-      - run: just test-live
+      - run: uv sync
+      - run: uv run pytest -m live

@@ -27,10 +27,10 @@ Only public data is listed. NOMAD's rate limits (HTTP 429 and 503) are retried.
 ## Development
 
 ```bash
-just install
-just test        # unit tests
-just test-live   # a few calls to nomad-lab.eu
-just lint
+uv sync
+uv run pytest -m "not live"  # unit tests
+uv run pytest -m live        # a few calls to nomad-lab.eu
+uv run ruff check . && uv run ruff format --check . && uv run mypy src
 ```
 
 ## License

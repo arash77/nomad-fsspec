@@ -191,7 +191,9 @@ class NomadFileSystem(AbstractFileSystem):
             # NOMAD sets a cursor even on the last page, so a short page is the end
             if len(result["data"]) < AGGREGATION_PAGE_SIZE:
                 return buckets
-            after = result["pagination"]["next_page_after_value"]
+            after = (result.get("pagination") or {}).get("next_page_after_value")
+            if after is None:
+                return buckets
 
 
 def _split(path: str) -> list[str]:

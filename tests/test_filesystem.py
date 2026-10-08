@@ -237,3 +237,10 @@ def test_partial_reads_use_offset_and_length():
 def test_writing_is_refused():
     with pytest.raises(PermissionError):
         make_fs().open("/ds1/up1/new.txt", "wb")
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_a_full_aggregation_page_without_a_cursor_ends_the_listing(monkeypatch):
+    monkeypatch.setattr(filesystem, "AGGREGATION_PAGE_SIZE", 2)
+    responses.post(f"{API}/entries/query", json=aggregation("up1", "up2"))
+    assert make_fs().ls("/ds1", detail=False) == ["/ds1/up1", "/ds1/up2"]

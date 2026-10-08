@@ -163,7 +163,7 @@ class NomadFileSystem(AbstractFileSystem):
             )
             offset += len(page)
             if not page or offset >= body["pagination"]["total"]:
-                return entries
+                return _by_name(entries)
 
     def _list_uploads(self, dataset_id: str) -> list[dict[str, Any]]:
         query = {"datasets.dataset_id": dataset_id}
@@ -177,9 +177,7 @@ class NomadFileSystem(AbstractFileSystem):
             )
             for bucket in buckets
         ]
-        return sorted(
-            uploads, key=lambda upload: (upload["display_name"].casefold(), upload["name"])
-        )
+        return _by_name(uploads)
 
     def _list_upload_directory(self, parts: list[str]) -> list[dict[str, Any]]:
         path = "/" + "/".join(parts)
@@ -248,6 +246,10 @@ def _split(path: str) -> list[str]:
 def _directory(path: str, display_name: str | None) -> dict[str, Any]:
     name = display_name or path.rsplit("/", 1)[-1]
     return {"name": path, "size": 0, "type": "directory", "display_name": name}
+
+
+def _by_name(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(entries, key=lambda entry: (entry["display_name"].casefold(), entry["name"]))
 
 
 def _raw(parts: list[str]) -> list[str]:

@@ -335,3 +335,12 @@ def test_a_missing_path_is_reported_by_its_own_name(tmp_path):
         with pytest.raises(FileNotFoundError) as error:
             call(path)
         assert path in str(error.value) and "rawdir" not in str(error.value)
+
+
+@responses.activate
+def test_datasets_are_sorted_by_name_ignoring_case():
+    responses.post(f"{API}/entries/query", json=aggregation("ds1", "ds2", "ds3"))
+    names = [("ds1", "Beta"), ("ds2", "Zeta"), ("ds3", "alpha")]
+    data = [{"dataset_id": i, "dataset_name": name} for i, name in names]
+    responses.get(f"{API}/datasets/", json={"pagination": {"total": 3}, "data": data})
+    assert [entry["display_name"] for entry in make_fs().ls("/")] == ["alpha", "Beta", "Zeta"]

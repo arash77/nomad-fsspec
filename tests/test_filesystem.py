@@ -115,3 +115,77 @@ def test_a_dataset_without_public_uploads_is_not_found():
 
 def test_nomad_error_is_exported():
     assert issubclass(NomadError, Exception)
+
+
+def rawdir(*content, total=None):
+    return {
+        "directory_metadata": {"content": list(content)},
+        "pagination": {"total": len(content) if total is None else total},
+    }
+
+
+def page(size, offset):
+    return matchers.query_param_matcher({"page_size": str(size), "page_offset": str(offset)})
+
+
+@responses.activate
+def test_upload_directory_pages_until_the_total(monkeypatch):
+    monkeypatch.setattr(filesystem, "PAGE_SIZE", 2)
+    url = f"{API}/uploads/up1/rawdir/data/"
+    first = rawdir(
+        {"name": "a.txt", "size": 5, "is_file": True},
+        {"name": "sub", "size": 9, "is_file": False},
+        total=4,
+    )
+    second = rawdir({"name": "", "is_file": False}, {"name": "z.txt", "is_file": True}, total=4)
+    responses.get(url, match=[page(2, 0)], json=first)
+    responses.get(url, match=[page(2, 2)], json=second)
+    fs = make_fs()
+    entries = fs.ls("/ds1/up1/data")
+    assert [(e["name"], e["type"], e["size"]) for e in entries] == [
+        ("/ds1/up1/data/a.txt", "file", 5),
+        ("/ds1/up1/data/sub", "directory", 9),
+        ("/ds1/up1/data/z.txt", "file", 0),
+    ]
+    assert fs.info("/ds1/up1/data/a.txt")["size"] == 5
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_an_empty_page_ends_the_listing(monkeypatch):
+    monkeypatch.setattr(filesystem, "PAGE_SIZE", 1)
+    url = f"{API}/uploads/up1/rawdir/"
+    responses.get(url, match=[page(1, 0)], json=rawdir({"name": "a", "is_file": True}, total=5))
+    responses.get(url, match=[page(1, 1)], json=rawdir(total=5))
+    assert [e["name"] for e in make_fs().ls("/ds1/up1")] == ["/ds1/up1/a"]
+
+
+@responses.activate
+def test_listing_a_file_returns_the_file():
+    responses.get(
+        f"{API}/uploads/up1/rawdir/a.txt/", json={"file_metadata": {"name": "", "size": 7}}
+    )
+    assert make_fs().ls("/ds1/up1/a.txt") == [{"name": "/ds1/up1/a.txt", "size": 7, "type": "file"}]
+
+
+@responses.activate
+def test_dot_segments_are_refused():
+    with pytest.raises(ValueError):
+        make_fs().ls("/ds1/up1/../up2")
+
+
+@responses.activate
+def test_a_failing_folder_is_not_hidden_by_walk():
+    responses.get(f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "sub", "is_file": False}))
+    responses.get(f"{API}/uploads/up1/rawdir/sub/", status=500, json={"detail": "boom"})
+    with pytest.raises(NomadError, match="boom"):
+        list(make_fs().walk("/ds1/up1"))
+
+
+@responses.activate
+def test_a_folder_lists_its_contents_after_its_parent_was_listed():
+    responses.get(f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "sub", "is_file": False}))
+    responses.get(f"{API}/uploads/up1/rawdir/sub/", json=rawdir({"name": "b.txt", "is_file": True}))
+    fs = make_fs()
+    fs.ls("/ds1/up1")
+    assert fs.ls("/ds1/up1/sub", detail=False) == ["/ds1/up1/sub/b.txt"]

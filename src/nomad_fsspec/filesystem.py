@@ -37,10 +37,13 @@ class NomadFileSystem(AbstractFileSystem):
 
     def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
         path = self._strip_protocol(path)
-        entries = self._ls_from_cache(path)
-        if entries is None:
+        # not _ls_from_cache: it answers a folder with its own entry once the parent is cached
+        key = path.rstrip("/")
+        try:
+            entries = self.dircache[key]
+        except KeyError:
             entries = self._fetch(path)
-            self.dircache[path.rstrip("/")] = entries
+            self.dircache[key] = entries
         return entries if detail else [entry["name"] for entry in entries]
 
     def _fetch(self, path: str) -> list[dict[str, Any]]:
@@ -49,7 +52,7 @@ class NomadFileSystem(AbstractFileSystem):
             return self._list_datasets()
         if len(parts) == 1:
             return self._list_uploads(parts[0])
-        raise FileNotFoundError(path)
+        return self._list_upload_directory(parts)
 
     def _list_datasets(self) -> list[dict[str, Any]]:
         public = {bucket["value"] for bucket in self._aggregate("datasets.dataset_id", {})}
@@ -88,6 +91,31 @@ class NomadFileSystem(AbstractFileSystem):
         return sorted(
             uploads, key=lambda upload: (upload["display_name"].casefold(), upload["name"])
         )
+
+    def _list_upload_directory(self, parts: list[str]) -> list[dict[str, Any]]:
+        path = "/" + "/".join(parts)
+        entries: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            params = {"page_size": PAGE_SIZE, "page_offset": offset}
+            body = self.client.get_json(["uploads", parts[1], "rawdir", *parts[2:], ""], params)
+            if "directory_metadata" not in body:
+                size = (body.get("file_metadata") or {}).get("size")
+                return [{"name": path, "size": int(size or 0), "type": "file"}]
+            content = body["directory_metadata"]["content"]
+            entries.extend(
+                {
+                    "name": f"{path}/{item['name']}",
+                    "size": int(item.get("size") or 0),
+                    "type": "file" if item.get("is_file") else "directory",
+                }
+                for item in content
+                if item.get("name")
+            )
+            offset += len(content)
+            # an empty page or the total ends the listing; NOMAD answers 400 past the last page
+            if not content or offset >= body["pagination"]["total"]:
+                return entries
 
     def _aggregate(
         self, quantity: str, query: dict[str, Any], include: list[str] | None = None

@@ -1,4 +1,8 @@
+import io
+
+import fsspec.callbacks
 import pytest
+import requests
 import responses
 from responses import matchers, registries
 
@@ -144,7 +148,7 @@ def test_upload_directory_pages_until_the_total(monkeypatch):
     entries = fs.ls("/ds1/up1/data")
     assert [(e["name"], e["type"], e["size"]) for e in entries] == [
         ("/ds1/up1/data/a.txt", "file", 5),
-        ("/ds1/up1/data/sub", "directory", 9),
+        ("/ds1/up1/data/sub", "directory", 0),
         ("/ds1/up1/data/z.txt", "file", 0),
     ]
     assert fs.info("/ds1/up1/data/a.txt")["size"] == 5
@@ -209,9 +213,10 @@ def test_get_file_streams_one_request(tmp_path):
 
 
 @responses.activate
-def test_get_file_refuses_a_dataset_or_an_upload(tmp_path):
-    with pytest.raises(IsADirectoryError):
-        make_fs().get_file("/ds1/up1", str(tmp_path / "x"))
+def test_get_file_of_a_dataset_or_an_upload_makes_a_local_folder(tmp_path):
+    make_fs().get_file("/ds1/up1", str(tmp_path / "x"))
+    assert (tmp_path / "x").is_dir()
+    assert len(responses.calls) == 0
 
 
 @responses.activate
@@ -244,3 +249,89 @@ def test_a_full_aggregation_page_without_a_cursor_ends_the_listing(monkeypatch):
     monkeypatch.setattr(filesystem, "AGGREGATION_PAGE_SIZE", 2)
     responses.post(f"{API}/entries/query", json=aggregation("up1", "up2"))
     assert make_fs().ls("/ds1", detail=False) == ["/ds1/up1", "/ds1/up2"]
+
+
+@responses.activate
+def test_doubled_slashes_name_the_same_entry():
+    responses.get(
+        f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "f.txt", "size": 3, "is_file": True})
+    )
+    info = make_fs().info("/ds1/up1//f.txt")
+    assert (info["name"], info["type"], info["size"]) == ("/ds1/up1/f.txt", "file", 3)
+
+
+@responses.activate
+def test_refresh_and_invalidate_cache_fetch_again():
+    responses.get(f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "a", "is_file": True}))
+    fs = make_fs()
+    fs.ls("/ds1/up1")
+    fs.ls("/ds1/up1", refresh=True)
+    fs.invalidate_cache("/ds1/up1")
+    fs.ls("/ds1/up1")
+    fs.invalidate_cache()
+    fs.ls("/ds1/up1")
+    assert len(responses.calls) == 4
+
+
+@responses.activate
+def test_opening_a_folder_is_refused():
+    responses.get(f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "sub", "is_file": False}))
+    fs = make_fs()
+    for path in ("/ds1", "/ds1/up1/sub"):
+        with pytest.raises(IsADirectoryError):
+            fs.open(path).read()
+
+
+@responses.activate
+def test_get_copies_a_folder_tree(tmp_path):
+    responses.post(f"{API}/entries/query", json=aggregation("up1"))
+    responses.get(
+        f"{API}/uploads/up1/rawdir/",
+        json=rawdir(
+            {"name": "a.txt", "size": 1, "is_file": True}, {"name": "sub", "is_file": False}
+        ),
+    )
+    responses.get(
+        f"{API}/uploads/up1/rawdir/sub/", json=rawdir({"name": "b.txt", "size": 1, "is_file": True})
+    )
+    responses.get(f"{API}/uploads/up1/raw/a.txt", body=b"a")
+    responses.get(f"{API}/uploads/up1/raw/sub/b.txt", body=b"b")
+    make_fs().get("/ds1/up1", str(tmp_path / "out"), recursive=True)
+    copied = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
+    assert copied == ["out/a.txt", "out/sub/b.txt"]
+
+
+@responses.activate
+def test_get_file_writes_to_a_file_object_and_reports_progress():
+    responses.get(f"{API}/uploads/up1/raw/a.txt", body=b"abc")
+    target = io.BytesIO()
+    callback = fsspec.callbacks.Callback()
+    make_fs().get_file("/ds1/up1/a.txt", target, callback=callback)
+    assert (target.getvalue(), callback.value) == (b"abc", 3)
+
+
+@responses.activate
+def test_a_failed_download_leaves_no_partial_file(tmp_path, monkeypatch):
+    responses.get(f"{API}/uploads/up1/raw/a.txt", body=b"abc")
+
+    def cut(chunks, target, callback):
+        target.write(b"a")
+        raise requests.exceptions.ChunkedEncodingError("cut")
+
+    monkeypatch.setattr(filesystem, "_copy", cut)
+    target = tmp_path / "a.txt"
+    with pytest.raises(NomadError):
+        make_fs().get_file("/ds1/up1/a.txt", str(target))
+    assert not target.exists()
+
+
+@responses.activate
+def test_a_missing_path_is_reported_by_its_own_name(tmp_path):
+    missing = {"status": 404, "json": {"detail": "Not found. Invalid path?"}}
+    responses.get(f"{API}/uploads/up1/rawdir/gone/", **missing)
+    responses.get(f"{API}/uploads/up1/raw/gone.txt", **missing)
+    fs = make_fs()
+    for call, path in ((fs.ls, "/ds1/up1/gone"), (fs.cat_file, "/ds1/up1/gone.txt")):
+        with pytest.raises(FileNotFoundError) as error:
+            call(path)
+        assert path in str(error.value) and "rawdir" not in str(error.value)

@@ -1,6 +1,12 @@
+import errno
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import IO, Any
 
 from fsspec import AbstractFileSystem
+from fsspec.callbacks import DEFAULT_CALLBACK
+from fsspec.utils import isfilelike
 
 from .client import DEFAULT_BASE_URL, NomadClient
 
@@ -33,35 +39,62 @@ class NomadFileSystem(AbstractFileSystem):
     def _strip_protocol(cls, path: Any) -> Any:
         if isinstance(path, list):
             return [cls._strip_protocol(p) for p in path]
-        return "/" + super()._strip_protocol(path).strip("/")
+        parts = super()._strip_protocol(path).split("/")
+        return "/" + "/".join(part for part in parts if part)
 
-    def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
+    def ls(self, path: str, detail: bool = True, refresh: bool = False, **kwargs: Any) -> list[Any]:
         path = self._strip_protocol(path)
         # not _ls_from_cache: it answers a folder with its own entry once the parent is cached
         key = path.rstrip("/")
-        try:
-            entries = self.dircache[key]
-        except KeyError:
-            entries = self._fetch(path)
+        entries = None if refresh else self.dircache.get(key)
+        if entries is None:
+            with _named(path):
+                entries = self._fetch(path)
             self.dircache[key] = entries
         return entries if detail else [entry["name"] for entry in entries]
+
+    def invalidate_cache(self, path: str | None = None) -> None:
+        if path is None:
+            self.dircache.clear()
+        else:
+            self.dircache.pop(self._strip_protocol(path).rstrip("/"), None)
 
     def get_file(
         self,
         rpath: str,
         lpath: Any = None,
-        callback: Any = None,
+        callback: Any = DEFAULT_CALLBACK,
         outfile: IO[bytes] | None = None,
         **kwargs: Any,
     ) -> None:
+        rpath = self._strip_protocol(rpath)
+        if isfilelike(lpath):
+            outfile = lpath
+        elif len(_split(rpath)) < 3 or self._cached_type(rpath) == "directory":
+            # only the cached listing is asked, so a plain download stays one request
+            os.makedirs(lpath, exist_ok=True)
+            return
         parts = self._file_parts(rpath)
         params = {"ignore_mime_type": "true"}
-        with self.client.request("GET", _raw(parts), params=params, stream=True) as response:
-            if outfile is not None:
-                _copy(response.iter_content(CHUNK_SIZE), outfile)
-            else:
-                with open(lpath, "wb") as target:
-                    _copy(response.iter_content(CHUNK_SIZE), target)
+        callback = callback or DEFAULT_CALLBACK
+        created = False
+        try:
+            with (
+                _named(rpath),
+                self.client.request("GET", _raw(parts), params=params, stream=True) as response,
+            ):
+                chunks = response.iter_content(CHUNK_SIZE)
+                if outfile is not None:
+                    _copy(chunks, outfile, callback)
+                else:
+                    os.makedirs(os.path.dirname(os.path.abspath(lpath)), exist_ok=True)
+                    with open(lpath, "wb") as target:
+                        created = True
+                        _copy(chunks, target, callback)
+        except BaseException:
+            if created:
+                os.remove(lpath)
+            raise
 
     def cat_file(
         self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
@@ -80,13 +113,21 @@ class NomadFileSystem(AbstractFileSystem):
             params["offset"] = start
         if end is not None:
             params["length"] = end - start
-        with self.client.request("GET", _raw(parts), params=params) as response:
+        with _named(path), self.client.request("GET", _raw(parts), params=params) as response:
             return response.content
 
     def _open(self, path: str, mode: str = "rb", **kwargs: Any) -> Any:
         if mode != "rb":
             raise PermissionError(f"NOMAD is read-only; cannot open {path} with mode {mode!r}")
-        return super()._open(path, mode=mode, **kwargs)
+        self._file_parts(path)
+        info = self.info(path)
+        if info["type"] == "directory":
+            raise IsADirectoryError(path)
+        return super()._open(path, mode=mode, size=info["size"], **kwargs)
+
+    def _cached_type(self, path: str) -> str | None:
+        listing = self.dircache.get(self._parent(path).rstrip("/")) or []
+        return next((entry["type"] for entry in listing if entry["name"] == path), None)
 
     def _file_parts(self, path: str) -> list[str]:
         parts = _split(self._strip_protocol(path))
@@ -154,7 +195,8 @@ class NomadFileSystem(AbstractFileSystem):
             entries.extend(
                 {
                     "name": f"{path}/{item['name']}",
-                    "size": int(item.get("size") or 0),
+                    # NOMAD gives folders the size of everything inside; fsspec expects 0
+                    "size": int(item.get("size") or 0) if item.get("is_file") else 0,
                     "type": "file" if item.get("is_file") else "directory",
                 }
                 for item in content
@@ -212,6 +254,18 @@ def _raw(parts: list[str]) -> list[str]:
     return ["uploads", parts[1], "raw", *parts[2:]]
 
 
-def _copy(chunks: Any, target: IO[bytes]) -> None:
+def _copy(chunks: Any, target: IO[bytes], callback: Any) -> None:
     for chunk in chunks:
         target.write(chunk)
+        callback.relative_update(len(chunk))
+
+
+@contextmanager
+def _named(path: str) -> Iterator[None]:
+    """Report a missing path or a folder by its own name, not by NOMAD's API route."""
+    try:
+        yield
+    except FileNotFoundError as e:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", path) from e
+    except IsADirectoryError as e:
+        raise IsADirectoryError(errno.EISDIR, "Is a directory", path) from e

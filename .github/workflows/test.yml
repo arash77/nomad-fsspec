@@ -31,6 +31,16 @@ jobs:
       - run: uv run mypy src
       - run: uv run pytest -m "not live"
 
+  lowest:
+    name: Unit tests with the lowest supported dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv run --isolated --python 3.10 --resolution lowest-direct pytest -m "not live"
+
   live:
     name: Live tests (nomad-lab.eu)
     runs-on: ubuntu-latest

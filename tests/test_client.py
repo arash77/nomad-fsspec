@@ -2,6 +2,7 @@ import pytest
 import requests
 import responses
 from responses import registries
+from urllib3.response import HTTPResponse
 
 from nomad_fsspec.client import NomadClient
 from nomad_fsspec.errors import NomadError
@@ -45,7 +46,7 @@ def test_errors_are_mapped():
         client.get_json(["c"])
     with pytest.raises(NomadError, match="did not answer like a NOMAD API"):
         client.get_json(["d"])
-    with pytest.raises(NomadError, match="Could not reach NOMAD"):
+    with pytest.raises(NomadError, match="Request to NOMAD at nomad.example.org failed"):
         client.get_json(["e"])
     assert not issubclass(NomadError, OSError)
 
@@ -56,3 +57,28 @@ def test_rate_limited_and_unavailable_answers_are_retried():
     responses.get(f"{API}/x", status=429, headers={"Retry-After": "0"})
     responses.get(f"{API}/x", json={"ok": True})
     assert NomadClient(API).get_json(["x"]) == {"ok": True}
+
+
+def test_retry_waits_are_capped_and_odd_retry_after_values_are_tolerated():
+    retry = NomadClient(API).session.get_adapter(API).max_retries
+    assert retry.get_retry_after(HTTPResponse(headers={"Retry-After": "3600"})) == 10
+    assert retry.get_retry_after(HTTPResponse(headers={"Retry-After": "1.5"})) is None
+
+
+def test_a_slow_answer_is_not_requested_again():
+    retry = NomadClient(API).session.get_adapter(API).max_retries
+    assert retry.read == 0
+
+
+def test_credentials_in_the_base_url_stay_out_of_messages():
+    assert NomadClient("https://alice:s3cret@oasis.example.org:8443/nomad").host == (
+        "oasis.example.org:8443"
+    )
+
+
+@responses.activate
+def test_downloading_a_folder_is_an_is_a_directory_error():
+    detail = "Path is a directory, `compress` must be set to true"
+    responses.get(f"{API}/uploads/u1/raw/data", status=400, json={"detail": detail})
+    with pytest.raises(IsADirectoryError):
+        NomadClient(API).get_json(["uploads", "u1", "raw", "data"])

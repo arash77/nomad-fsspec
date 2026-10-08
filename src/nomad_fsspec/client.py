@@ -5,12 +5,25 @@ from urllib.parse import quote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InvalidHeader
 from urllib3.util.retry import Retry
 
 from .errors import NomadError
 
 DEFAULT_BASE_URL = "https://nomad-lab.eu/prod/v1"
 API_PATH = "/api/v1"
+MAX_RETRY_AFTER = 10
+
+
+class _Retry(Retry):
+    """Honour NOMAD's Retry-After, but never wait long or fail on an odd value."""
+
+    def get_retry_after(self, response: Any) -> float | None:
+        try:
+            seconds = super().get_retry_after(response)
+        except InvalidHeader:
+            return None
+        return None if seconds is None else min(seconds, MAX_RETRY_AFTER)
 
 
 class NomadClient:
@@ -23,12 +36,16 @@ class NomadClient:
         if base.endswith(API_PATH):
             base = base[: -len(API_PATH)]
         self.api_url = base + API_PATH
-        self.host = urlparse(base).netloc or base
+        parsed = urlparse(base)
+        self.host = (parsed.hostname or base) + (f":{parsed.port}" if parsed.port else "")
         self.timeout = timeout
-        # NOMAD refuses bursts with 429 or 503, usually with Retry-After
-        retry = Retry(
-            total=5,
-            backoff_factor=1,
+        # NOMAD refuses bursts with 429 or 503; a slow answer is not asked for again
+        retry = _Retry(
+            total=4,
+            connect=1,
+            read=0,
+            status=3,
+            backoff_factor=0.5,
             status_forcelist=[429, 503],
             allowed_methods={"GET", "POST"},
             respect_retry_after_header=True,
@@ -60,7 +77,7 @@ class NomadClient:
                 self._raise_for_status(response, label)
                 yield response
         except requests.RequestException as e:
-            raise NomadError(f"Could not reach NOMAD at {self.host}: {e}") from e
+            raise NomadError(f"Request to NOMAD at {self.host} failed: {e}") from e
 
     def _raise_for_status(self, response: requests.Response, label: str) -> None:
         if response.ok:
@@ -70,6 +87,8 @@ class NomadClient:
             raise FileNotFoundError(f"{label}: {detail}")
         if response.status_code in (401, 403):
             raise PermissionError(f"NOMAD at {self.host} refused access to {label}: {detail}")
+        if response.status_code == 400 and "is a directory" in detail.lower():
+            raise IsADirectoryError(label)
         raise NomadError(
             f"NOMAD at {self.host} answered HTTP {response.status_code} for {label}: {detail}"
         )

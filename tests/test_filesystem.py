@@ -189,3 +189,51 @@ def test_a_folder_lists_its_contents_after_its_parent_was_listed():
     fs = make_fs()
     fs.ls("/ds1/up1")
     assert fs.ls("/ds1/up1/sub", detail=False) == ["/ds1/up1/sub/b.txt"]
+
+
+def raw_params(**extra):
+    return matchers.query_param_matcher({"ignore_mime_type": "true", **extra})
+
+
+@responses.activate
+def test_get_file_streams_one_request(tmp_path):
+    responses.get(
+        f"{API}/uploads/up1/raw/data/run%20%231%20100%25.csv",
+        match=[raw_params()],
+        body=b"a,b\n1,2\n",
+    )
+    target = tmp_path / "out.csv"
+    make_fs().get_file("/ds1/up1/data/run #1 100%.csv", str(target))
+    assert target.read_bytes() == b"a,b\n1,2\n"
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_file_refuses_a_dataset_or_an_upload(tmp_path):
+    with pytest.raises(IsADirectoryError):
+        make_fs().get_file("/ds1/up1", str(tmp_path / "x"))
+
+
+@responses.activate
+def test_partial_reads_use_offset_and_length():
+    url = f"{API}/uploads/up1/raw/a.bin"
+    responses.get(
+        f"{API}/uploads/up1/rawdir/", json=rawdir({"name": "a.bin", "size": 10, "is_file": True})
+    )
+    responses.get(url, match=[raw_params(offset="2", length="3")], body=b"cde")
+    responses.get(url, match=[raw_params(length="2")], body=b"ab")
+    responses.get(url, match=[raw_params(offset="8")], body=b"ij")
+    responses.get(url, match=[raw_params(length="10")], body=b"abcdefghij")
+    fs = make_fs()
+    assert fs.cat_file("/ds1/up1/a.bin", start=2, end=5) == b"cde"
+    assert fs.cat_file("/ds1/up1/a.bin", end=2) == b"ab"
+    assert fs.cat_file("/ds1/up1/a.bin", start=3, end=3) == b""
+    assert fs.cat_file("/ds1/up1/a.bin", start=-2) == b"ij"
+    with fs.open("/ds1/up1/a.bin", "rb") as handle:
+        assert handle.read() == b"abcdefghij"
+
+
+@responses.activate
+def test_writing_is_refused():
+    with pytest.raises(PermissionError):
+        make_fs().open("/ds1/up1/new.txt", "wb")

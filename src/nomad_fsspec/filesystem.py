@@ -1,4 +1,4 @@
-from typing import Any
+from typing import IO, Any
 
 from fsspec import AbstractFileSystem
 
@@ -45,6 +45,54 @@ class NomadFileSystem(AbstractFileSystem):
             entries = self._fetch(path)
             self.dircache[key] = entries
         return entries if detail else [entry["name"] for entry in entries]
+
+    def get_file(
+        self,
+        rpath: str,
+        lpath: Any = None,
+        callback: Any = None,
+        outfile: IO[bytes] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        parts = self._file_parts(rpath)
+        params = {"ignore_mime_type": "true"}
+        with self.client.request("GET", _raw(parts), params=params, stream=True) as response:
+            if outfile is not None:
+                _copy(response.iter_content(CHUNK_SIZE), outfile)
+            else:
+                with open(lpath, "wb") as target:
+                    _copy(response.iter_content(CHUNK_SIZE), target)
+
+    def cat_file(
+        self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
+    ) -> bytes:
+        parts = self._file_parts(path)
+        start = start or 0
+        if start < 0 or (end is not None and end < 0):
+            size = int(self.info(path)["size"])
+            start = max(size + start, 0) if start < 0 else start
+            end = size + end if end is not None and end < 0 else end
+        if end is not None and end <= start:
+            return b""
+        # NOMAD ignores HTTP Range headers; it takes offset and length instead
+        params: dict[str, Any] = {"ignore_mime_type": "true"}
+        if start:
+            params["offset"] = start
+        if end is not None:
+            params["length"] = end - start
+        with self.client.request("GET", _raw(parts), params=params) as response:
+            return response.content
+
+    def _open(self, path: str, mode: str = "rb", **kwargs: Any) -> Any:
+        if mode != "rb":
+            raise PermissionError(f"NOMAD is read-only; cannot open {path} with mode {mode!r}")
+        return super()._open(path, mode=mode, **kwargs)
+
+    def _file_parts(self, path: str) -> list[str]:
+        parts = _split(self._strip_protocol(path))
+        if len(parts) < 3:
+            raise IsADirectoryError(path)
+        return parts
 
     def _fetch(self, path: str) -> list[dict[str, Any]]:
         parts = _split(path)
@@ -156,3 +204,12 @@ def _split(path: str) -> list[str]:
 def _directory(path: str, display_name: str | None) -> dict[str, Any]:
     name = display_name or path.rsplit("/", 1)[-1]
     return {"name": path, "size": 0, "type": "directory", "display_name": name}
+
+
+def _raw(parts: list[str]) -> list[str]:
+    return ["uploads", parts[1], "raw", *parts[2:]]
+
+
+def _copy(chunks: Any, target: IO[bytes]) -> None:
+    for chunk in chunks:
+        target.write(chunk)

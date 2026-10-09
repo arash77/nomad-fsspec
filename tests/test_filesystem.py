@@ -123,6 +123,34 @@ def test_upload_names_are_asked_for_in_batches_and_kept(monkeypatch):
     assert len(responses.calls) == 2
 
 
+@responses.activate(registry=registries.OrderedRegistry)
+def test_search_matches_names_before_asking_for_uploads():
+    dataset = {"datasets.dataset_id": "ds1"}
+    responses.post(
+        f"{API}/entries/query",
+        match=[matchers.json_params_matcher(aggregation_body("upload_name", dataset, 2500))],
+        json=aggregation("Alexandria upload", "other"),
+    )
+    responses.post(
+        f"{API}/entries/query",
+        match=[
+            matchers.json_params_matcher(
+                aggregation_body(
+                    "upload_id", {**dataset, "upload_name:any": ["Alexandria upload"]}, 2500
+                )
+            )
+        ],
+        json=aggregation("up1", "up2"),
+    )
+    fs = make_fs()
+    assert fs.search_uploads("ds1", "ALEXANDRIA") == {
+        "up1": "Alexandria upload",
+        "up2": "Alexandria upload",
+    }
+    assert fs.upload_names(["up1"]) == {"up1": "Alexandria upload"}
+    assert len(responses.calls) == 2
+
+
 @responses.activate
 def test_a_token_lists_the_uploads_of_its_user_and_reads_them():
     auth = matchers.header_matcher({"Authorization": "Bearer my-token"})

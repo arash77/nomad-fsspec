@@ -23,7 +23,7 @@ class NomadFileSystem(AbstractFileSystem):
 
     Without a token, paths are ``/<dataset_id>/<upload_id>/<path inside the upload>`` and only
     public data is listed. Uploads inside a dataset are listed by id; ``upload_names`` looks up
-    their names.
+    their names and ``search_uploads`` finds them by name.
 
     With a token, the top level lists the uploads the token's user can read, published or not,
     and paths are ``/<upload_id>/<path inside the upload>``.
@@ -154,6 +154,26 @@ class NomadFileSystem(AbstractFileSystem):
                 names[bucket["value"]] = (bucket.get("entries") or [{}])[0].get("upload_name")
             self._upload_names.update(names)
         return {upload_id: name for upload_id in wanted if (name := self._upload_names[upload_id])}
+
+    def search_uploads(self, dataset_id: str, text: str) -> dict[str, str]:
+        """Find the public uploads of a dataset whose name contains ``text``, ignoring case.
+
+        Matches names first, so the cost grows with the uploads found, not with the dataset.
+        """
+        needle = text.casefold()
+        query: dict[str, Any] = {"datasets.dataset_id": dataset_id}
+        names = [
+            bucket["value"]
+            for bucket in self._aggregate("upload_name", query)
+            if needle in str(bucket["value"]).casefold()
+        ]
+        if not names:
+            return {}
+        found = self._aggregate("upload_id", {**query, "upload_name:any": names})
+        upload_ids = [bucket["value"] for bucket in found]
+        if len(names) == 1:
+            self._upload_names.update(dict.fromkeys(upload_ids, names[0]))
+        return self.upload_names(upload_ids)
 
     def _cached_type(self, path: str) -> str | None:
         listing = self.dircache.get(self._parent(path).rstrip("/")) or []

@@ -82,3 +82,11 @@ def test_downloading_a_folder_is_an_is_a_directory_error():
     responses.get(f"{API}/uploads/u1/raw/data", status=400, json={"detail": detail})
     with pytest.raises(IsADirectoryError):
         NomadClient(API).get_json(["uploads", "u1", "raw", "data"])
+
+
+@responses.activate
+def test_redirects_are_not_followed():
+    responses.get(f"{API}/x", status=307, headers={"Location": "http://10.0.0.1/x"})
+    with pytest.raises(NomadError, match="redirected /x to http://10.0.0.1/x"):
+        NomadClient(API).get_json(["x"])
+    assert len(responses.calls) == 1

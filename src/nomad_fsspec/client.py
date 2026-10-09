@@ -30,7 +30,10 @@ class NomadClient:
     """A small client for NOMAD's REST API."""
 
     def __init__(
-        self, base_url: str = DEFAULT_BASE_URL, timeout: tuple[float, float] = (10, 120)
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: tuple[float, float] = (10, 120),
+        token: str | None = None,
     ) -> None:
         base = base_url.strip().rstrip("/")
         if base.endswith(API_PATH):
@@ -55,6 +58,8 @@ class NomadClient:
         self.session = requests.Session()
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
 
     def url(self, parts: list[str]) -> str:
         return "/".join([self.api_url, *(quote(part, safe="") for part in parts)])
@@ -71,8 +76,9 @@ class NomadClient:
     def request(self, method: str, parts: list[str], **kwargs: Any) -> Iterator[requests.Response]:
         label = "/" + "/".join(parts)
         try:
+            # NOMAD's API does not redirect, and a redirect could lead to an address nobody checked
             with self.session.request(
-                method, self.url(parts), timeout=self.timeout, **kwargs
+                method, self.url(parts), timeout=self.timeout, allow_redirects=False, **kwargs
             ) as response:
                 self._raise_for_status(response, label)
                 yield response
@@ -80,6 +86,12 @@ class NomadClient:
             raise NomadError(f"Request to NOMAD at {self.host} failed: {e}") from e
 
     def _raise_for_status(self, response: requests.Response, label: str) -> None:
+        if response.is_redirect:
+            location = response.headers.get("Location")
+            raise NomadError(
+                f"NOMAD at {self.host} redirected {label} to {location}; "
+                "use the address it redirects to as the base URL"
+            )
         if response.ok:
             return
         detail = _detail(response)

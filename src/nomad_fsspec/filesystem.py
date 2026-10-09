@@ -1,6 +1,6 @@
 import errno
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import IO, Any
 
@@ -13,14 +13,22 @@ from .client import DEFAULT_BASE_URL, NomadClient
 # NOMAD reads a whole directory for every page, so ask for all of it at once
 PAGE_SIZE = 10000
 AGGREGATION_PAGE_SIZE = 2500
+# NOMAD takes about 0.7 s to name 25 uploads but 7 s to name 100
+NAMES_BATCH = 25
 CHUNK_SIZE = 2**20
 
 
 class NomadFileSystem(AbstractFileSystem):
-    """Read-only access to the public datasets of a NOMAD deployment.
+    """Read-only access to the raw files of a NOMAD deployment.
 
-    Paths are ``/<dataset_id>/<upload_id>/<path inside the upload>``. Datasets and uploads carry
-    their names in ``display_name``.
+    Without a token, paths are ``/<dataset_id>/<upload_id>/<path inside the upload>`` and only
+    public data is listed. Uploads inside a dataset are listed by id; ``upload_names`` looks up
+    their names.
+
+    With a token, the top level lists the uploads the token's user can read, published or not,
+    and paths are ``/<upload_id>/<path inside the upload>``.
+
+    Datasets and uploads listed with their names carry them in ``display_name``.
     """
 
     protocol = "nomad"
@@ -30,10 +38,14 @@ class NomadFileSystem(AbstractFileSystem):
         self,
         base_url: str = DEFAULT_BASE_URL,
         timeout: tuple[float, float] = (10, 120),
+        token: str | None = None,
         **storage_options: Any,
     ) -> None:
         super().__init__(**storage_options)
-        self.client = NomadClient(base_url, timeout)
+        self.client = NomadClient(base_url, timeout, token)
+        # path segments up to and including the upload id
+        self.upload_depth = 1 if token else 2
+        self._upload_names: dict[str, str | None] = {}
 
     @classmethod
     def _strip_protocol(cls, path: Any) -> Any:
@@ -56,6 +68,7 @@ class NomadFileSystem(AbstractFileSystem):
     def invalidate_cache(self, path: str | None = None) -> None:
         if path is None:
             self.dircache.clear()
+            self._upload_names.clear()
         else:
             self.dircache.pop(self._strip_protocol(path).rstrip("/"), None)
 
@@ -70,18 +83,20 @@ class NomadFileSystem(AbstractFileSystem):
         rpath = self._strip_protocol(rpath)
         if isfilelike(lpath):
             outfile = lpath
-        elif len(_split(rpath)) < 3 or self._cached_type(rpath) == "directory":
+        elif len(_split(rpath)) <= self.upload_depth or self._cached_type(rpath) == "directory":
             # only the cached listing is asked, so a plain download stays one request
+            if os.path.isfile(lpath):
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", rpath)
             os.makedirs(lpath, exist_ok=True)
             return
-        parts = self._file_parts(rpath)
+        raw = self._raw(self._file_parts(rpath))
         params = {"ignore_mime_type": "true"}
         callback = callback or DEFAULT_CALLBACK
         created = False
         try:
             with (
                 _named(rpath),
-                self.client.request("GET", _raw(parts), params=params, stream=True) as response,
+                self.client.request("GET", raw, params=params, stream=True) as response,
             ):
                 chunks = response.iter_content(CHUNK_SIZE)
                 if outfile is not None:
@@ -113,7 +128,7 @@ class NomadFileSystem(AbstractFileSystem):
             params["offset"] = start
         if end is not None:
             params["length"] = end - start
-        with _named(path), self.client.request("GET", _raw(parts), params=params) as response:
+        with _named(path), self.client.request("GET", self._raw(parts), params=params) as response:
             return response.content
 
     def _open(self, path: str, mode: str = "rb", **kwargs: Any) -> Any:
@@ -125,67 +140,90 @@ class NomadFileSystem(AbstractFileSystem):
             raise IsADirectoryError(path)
         return super()._open(path, mode=mode, size=info["size"], **kwargs)
 
+    def upload_names(self, upload_ids: Iterable[str]) -> dict[str, str]:
+        """Look up the names of public uploads, which a dataset's listing leaves out.
+
+        Names are kept, so only uploads not asked about before cost a request.
+        """
+        wanted = list(dict.fromkeys(upload_ids))
+        missing = [upload_id for upload_id in wanted if upload_id not in self._upload_names]
+        for start in range(0, len(missing), NAMES_BATCH):
+            batch = missing[start : start + NAMES_BATCH]
+            names: dict[str, str | None] = dict.fromkeys(batch)
+            for bucket in self._aggregate("upload_id", {"upload_id:any": batch}, ["upload_name"]):
+                names[bucket["value"]] = (bucket.get("entries") or [{}])[0].get("upload_name")
+            self._upload_names.update(names)
+        return {upload_id: name for upload_id in wanted if (name := self._upload_names[upload_id])}
+
     def _cached_type(self, path: str) -> str | None:
         listing = self.dircache.get(self._parent(path).rstrip("/")) or []
         return next((entry["type"] for entry in listing if entry["name"] == path), None)
 
     def _file_parts(self, path: str) -> list[str]:
         parts = _split(self._strip_protocol(path))
-        if len(parts) < 3:
+        if len(parts) <= self.upload_depth:
             raise IsADirectoryError(path)
         return parts
+
+    def _raw(self, parts: list[str]) -> list[str]:
+        return ["uploads", parts[self.upload_depth - 1], "raw", *parts[self.upload_depth :]]
 
     def _fetch(self, path: str) -> list[dict[str, Any]]:
         parts = _split(path)
         if not parts:
-            return self._list_datasets()
-        if len(parts) == 1:
-            return self._list_uploads(parts[0])
+            return self._list_datasets() if self.upload_depth == 2 else self._list_own_uploads()
+        if len(parts) < self.upload_depth:
+            return self._list_dataset_uploads(parts[0])
         return self._list_upload_directory(parts)
 
     def _list_datasets(self) -> list[dict[str, Any]]:
         public = {bucket["value"] for bucket in self._aggregate("datasets.dataset_id", {})}
-        entries: list[dict[str, Any]] = []
-        offset = 0
-        while True:
-            params = {
-                "page_size": PAGE_SIZE,
-                "page_offset": offset,
-                "order_by": "dataset_name",
-                "order": "asc",
-            }
-            body = self.client.get_json(["datasets", ""], params)
-            page = body["data"]
-            entries.extend(
+        params = {"order_by": "dataset_name", "order": "asc"}
+        return _by_name(
+            [
                 _directory(f"/{dataset['dataset_id']}", dataset.get("dataset_name"))
-                for dataset in page
+                for dataset in self._pages(["datasets", ""], params)
                 if dataset["dataset_id"] in public
-            )
-            offset += len(page)
-            if not page or offset >= body["pagination"]["total"]:
-                return _by_name(entries)
+            ]
+        )
 
-    def _list_uploads(self, dataset_id: str) -> list[dict[str, Any]]:
-        query = {"datasets.dataset_id": dataset_id}
-        buckets = self._aggregate("upload_id", query, include=["upload_name"])
+    def _list_own_uploads(self) -> list[dict[str, Any]]:
+        return _by_name(
+            [
+                _directory(f"/{upload['upload_id']}", upload.get("upload_name"))
+                for upload in self._pages(["uploads"], {})
+            ]
+        )
+
+    def _list_dataset_uploads(self, dataset_id: str) -> list[dict[str, Any]]:
+        # ids only: naming all uploads of a large dataset at once makes NOMAD time out
+        buckets = self._aggregate("upload_id", {"datasets.dataset_id": dataset_id})
         if not buckets:
             raise FileNotFoundError(f"/{dataset_id}")
-        uploads = [
-            _directory(
-                f"/{dataset_id}/{bucket['value']}",
-                (bucket.get("entries") or [{}])[0].get("upload_name"),
-            )
-            for bucket in buckets
-        ]
-        return _by_name(uploads)
+        return sorted(
+            (_directory(f"/{dataset_id}/{bucket['value']}", None) for bucket in buckets),
+            key=lambda entry: entry["name"],
+        )
+
+    def _pages(self, parts: list[str], params: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        offset = 0
+        while True:
+            page_params = {**params, "page_size": PAGE_SIZE, "page_offset": offset}
+            body = self.client.get_json(parts, page_params)
+            page = body.get("data") or []
+            yield from page
+            offset += len(page)
+            if not page or offset >= body["pagination"]["total"]:
+                return
 
     def _list_upload_directory(self, parts: list[str]) -> list[dict[str, Any]]:
         path = "/" + "/".join(parts)
+        upload_id, inner = parts[self.upload_depth - 1], parts[self.upload_depth :]
         entries: list[dict[str, Any]] = []
         offset = 0
         while True:
             params = {"page_size": PAGE_SIZE, "page_offset": offset}
-            body = self.client.get_json(["uploads", parts[1], "rawdir", *parts[2:], ""], params)
+            body = self.client.get_json(["uploads", upload_id, "rawdir", *inner, ""], params)
             if "directory_metadata" not in body:
                 size = (body.get("file_metadata") or {}).get("size")
                 return [{"name": path, "size": int(size or 0), "type": "file"}]
@@ -250,10 +288,6 @@ def _directory(path: str, display_name: str | None) -> dict[str, Any]:
 
 def _by_name(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(entries, key=lambda entry: (entry["display_name"].casefold(), entry["name"]))
-
-
-def _raw(parts: list[str]) -> list[str]:
-    return ["uploads", parts[1], "raw", *parts[2:]]
 
 
 def _copy(chunks: Any, target: IO[bytes], callback: Any) -> None:

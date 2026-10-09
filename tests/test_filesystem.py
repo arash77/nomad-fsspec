@@ -82,32 +82,76 @@ def test_root_lists_public_datasets_by_name_and_caches():
 
 
 @responses.activate(registry=registries.OrderedRegistry)
-def test_a_dataset_lists_its_uploads_across_pages(monkeypatch):
+def test_a_dataset_lists_its_uploads_by_id_across_pages(monkeypatch):
     monkeypatch.setattr(filesystem, "AGGREGATION_PAGE_SIZE", 2)
     query = {"datasets.dataset_id": "ds1"}
-    include = ["upload_name"]
     responses.post(
         f"{API}/entries/query",
-        match=[
-            matchers.json_params_matcher(aggregation_body("upload_id", query, 2, include=include))
-        ],
-        json=aggregation("up1", "up2", names={"up1": "b.zip", "up2": "a.zip"}, after="up2"),
+        match=[matchers.json_params_matcher(aggregation_body("upload_id", query, 2))],
+        json=aggregation("up3", "up1", after="up1"),
     )
     responses.post(
         f"{API}/entries/query",
-        match=[
-            matchers.json_params_matcher(
-                aggregation_body("upload_id", query, 2, after="up2", include=include)
-            )
-        ],
-        json=aggregation("up3", after="up3"),
+        match=[matchers.json_params_matcher(aggregation_body("upload_id", query, 2, after="up1"))],
+        json=aggregation("up2", after="up2"),
     )
     entries = make_fs().ls("/ds1")
     assert [(e["name"], e["display_name"]) for e in entries] == [
-        ("/ds1/up2", "a.zip"),
-        ("/ds1/up1", "b.zip"),
+        ("/ds1/up1", "up1"),
+        ("/ds1/up2", "up2"),
         ("/ds1/up3", "up3"),
     ]
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_upload_names_are_asked_for_in_batches_and_kept(monkeypatch):
+    monkeypatch.setattr(filesystem, "NAMES_BATCH", 2)
+    include = ["upload_name"]
+    for batch, names in (
+        (["up1", "up2"], {"up1": "a.zip", "up2": "b.zip"}),
+        (["up3"], {}),
+    ):
+        body = aggregation_body("upload_id", {"upload_id:any": batch}, 2500, include=include)
+        responses.post(
+            f"{API}/entries/query",
+            match=[matchers.json_params_matcher(body)],
+            json=aggregation(*names, names=names),
+        )
+    fs = make_fs()
+    assert fs.upload_names(["up1", "up2", "up3"]) == {"up1": "a.zip", "up2": "b.zip"}
+    assert fs.upload_names(["up3", "up2"]) == {"up2": "b.zip"}
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_a_token_lists_the_uploads_of_its_user_and_reads_them():
+    auth = matchers.header_matcher({"Authorization": "Bearer my-token"})
+    responses.get(
+        f"{API}/uploads",
+        match=[auth, page(10000, 0)],
+        json={
+            "pagination": {"total": 2},
+            "data": [
+                {"upload_id": "up2", "upload_name": "beta"},
+                {"upload_id": "up1", "upload_name": "Alpha"},
+            ],
+        },
+    )
+    responses.get(
+        f"{API}/uploads/up1/rawdir/",
+        match=[auth],
+        json=rawdir({"name": "a.txt", "size": 3, "is_file": True}),
+    )
+    responses.get(f"{API}/uploads/up1/raw/a.txt", match=[auth], body=b"abc")
+    fs = NomadFileSystem(base_url=BASE, token="my-token", skip_instance_cache=True)
+    assert [(e["name"], e["display_name"]) for e in fs.ls("/")] == [
+        ("/up1", "Alpha"),
+        ("/up2", "beta"),
+    ]
+    assert fs.ls("/up1", detail=False) == ["/up1/a.txt"]
+    assert fs.cat_file("/up1/a.txt") == b"abc"
+    with pytest.raises(IsADirectoryError):
+        fs.cat_file("/up1")
 
 
 @responses.activate
@@ -216,6 +260,15 @@ def test_get_file_streams_one_request(tmp_path):
 def test_get_file_of_a_dataset_or_an_upload_makes_a_local_folder(tmp_path):
     make_fs().get_file("/ds1/up1", str(tmp_path / "x"))
     assert (tmp_path / "x").is_dir()
+    assert len(responses.calls) == 0
+
+
+@responses.activate
+def test_get_file_of_a_folder_onto_a_local_file_is_refused(tmp_path):
+    target = tmp_path / "x"
+    target.write_bytes(b"")
+    with pytest.raises(IsADirectoryError, match="/ds1/up1"):
+        make_fs().get_file("/ds1/up1", str(target))
     assert len(responses.calls) == 0
 
 

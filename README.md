@@ -19,10 +19,10 @@ fs.get_file(
 Paths are `/<dataset id>/<upload id>/<path inside the upload>`, and only public data is listed.
 Datasets have their names in `display_name`. Uploads inside a dataset are listed by id, since
 naming all uploads of a large dataset at once makes NOMAD time out; `upload_names` looks names up
-25 at a time and keeps them, and `search_uploads` finds uploads by name.
+25 at a time and keeps them, and `search_uploads` finds the ids of uploads by name.
 
 With a token, the top level lists your uploads and those shared with you, published or not, as
-NOMAD's "Your uploads" page does. Paths are then `/<upload id>/<path inside the upload>`:
+NOMAD's uploads page does. Paths are then `/<upload id>/<path inside the upload>`:
 
 ```python
 fs = fsspec.filesystem("nomad", token="...")

@@ -31,9 +31,7 @@ def test_demo_file_downloads_and_reads_in_parts(fs, tmp_path):
     assert fs.upload_names(path.rsplit("/", 1)[-1] for path in uploads) == {
         "Xa2LB__ESiKu-odRBPJhjA": "nomad-demo-data.zip"
     }
-    assert fs.search_uploads(DEMO_DATASET.strip("/"), "DEMO-data") == {
-        "Xa2LB__ESiKu-odRBPJhjA": "nomad-demo-data.zip"
-    }
+    assert fs.search_uploads(DEMO_DATASET.strip("/"), "DEMO-data") == ["Xa2LB__ESiKu-odRBPJhjA"]
     assert fs.info(DEMO_FILE)["size"] == 424235
     target = tmp_path / "vasprun.xml"
     fs.get_file(DEMO_FILE, str(target))

@@ -155,10 +155,11 @@ class NomadFileSystem(AbstractFileSystem):
             self._upload_names.update(names)
         return {upload_id: name for upload_id in wanted if (name := self._upload_names[upload_id])}
 
-    def search_uploads(self, dataset_id: str, text: str) -> dict[str, str]:
+    def search_uploads(self, dataset_id: str, text: str) -> list[str]:
         """Find the public uploads of a dataset whose name contains ``text``, ignoring case.
 
-        Matches names first, so the cost grows with the uploads found, not with the dataset.
+        Returns their ids, for ``upload_names`` to name. Names are matched in NOMAD first, so
+        this takes two requests however large the dataset is. Uploads without a name never match.
         """
         needle = text.casefold()
         query: dict[str, Any] = {"datasets.dataset_id": dataset_id}
@@ -168,12 +169,12 @@ class NomadFileSystem(AbstractFileSystem):
             if needle in str(bucket["value"]).casefold()
         ]
         if not names:
-            return {}
+            return []
         found = self._aggregate("upload_id", {**query, "upload_name:any": names})
         upload_ids = [bucket["value"] for bucket in found]
         if len(names) == 1:
             self._upload_names.update(dict.fromkeys(upload_ids, names[0]))
-        return self.upload_names(upload_ids)
+        return upload_ids
 
     def _cached_type(self, path: str) -> str | None:
         listing = self.dircache.get(self._parent(path).rstrip("/")) or []

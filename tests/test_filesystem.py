@@ -143,10 +143,7 @@ def test_search_matches_names_before_asking_for_uploads():
         json=aggregation("up1", "up2"),
     )
     fs = make_fs()
-    assert fs.search_uploads("ds1", "ALEXANDRIA") == {
-        "up1": "Alexandria upload",
-        "up2": "Alexandria upload",
-    }
+    assert fs.search_uploads("ds1", "ALEXANDRIA") == ["up1", "up2"]
     assert fs.upload_names(["up1"]) == {"up1": "Alexandria upload"}
     assert len(responses.calls) == 2
 

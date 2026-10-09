@@ -122,5 +122,6 @@ def _detail(response: requests.Response) -> str:
     except (ValueError, AttributeError):
         detail = None
     if isinstance(detail, str):
-        return detail
+        # callers add their own full stop
+        return detail.rstrip(".")
     return response.reason or f"HTTP {response.status_code}"

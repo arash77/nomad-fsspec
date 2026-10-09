@@ -34,13 +34,13 @@ def test_path_segments_are_encoded_one_at_a_time():
 def test_errors_are_mapped():
     client = NomadClient(API)
     responses.get(f"{API}/a", status=404, json={"detail": "The specified upload_id was not found."})
-    responses.get(f"{API}/b", status=403, json={"detail": "Forbidden"})
+    responses.get(f"{API}/b", status=401, json={"detail": "The given token is invalid."})
     responses.get(f"{API}/c", status=500, body="<html>proxy error</html>")
     responses.get(f"{API}/d", body="<html>the NOMAD GUI</html>")
     responses.get(f"{API}/e", body=requests.ConnectionError("refused"))
     with pytest.raises(FileNotFoundError, match="upload_id was not found"):
         client.get_json(["a"])
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="token is invalid$"):
         client.get_json(["b"])
     with pytest.raises(NomadError, match="HTTP 500"):
         client.get_json(["c"])

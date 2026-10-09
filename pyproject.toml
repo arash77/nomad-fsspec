@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nomad-fsspec"
-version = "0.1.1"
-description = "An fsspec filesystem for the public raw data of NOMAD."
+version = "0.2.0"
+description = "An fsspec filesystem for the raw data of NOMAD."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

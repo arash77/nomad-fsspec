@@ -131,6 +131,11 @@ def test_upload_names_are_asked_for_in_batches_and_kept(monkeypatch):
     assert fs.upload_names(["up1", "up2", "up3"]) == {"up1": "a.zip", "up2": "b.zip"}
     assert fs.upload_names(["up3", "up2"]) == {"up2": "b.zip"}
     assert len(responses.calls) == 2
+    # past the limit, the kept names are dropped and asked for again
+    monkeypatch.setattr(filesystem, "MAX_NAMES", 2)
+    responses.post(f"{API}/entries/query", json=aggregation("up2", names={"up2": "b.zip"}))
+    assert fs.upload_names(["up2"]) == {"up2": "b.zip"}
+    assert len(responses.calls) == 3
 
 
 @responses.activate(registry=registries.OrderedRegistry)

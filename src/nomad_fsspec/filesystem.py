@@ -15,6 +15,8 @@ PAGE_SIZE = 10000
 AGGREGATION_PAGE_SIZE = 2500
 # NOMAD takes about 0.7 s to name 25 uploads but 7 s to name 100
 NAMES_BATCH = 25
+# upload names kept before they are dropped and asked for again
+MAX_NAMES = 10000
 CHUNK_SIZE = 2**20
 DATASETS = "datasets"
 UPLOADS = "uploads"
@@ -149,6 +151,8 @@ class NomadFileSystem(AbstractFileSystem):
         Names are kept, so only uploads not asked about before cost a request.
         """
         wanted = list(dict.fromkeys(upload_ids))
+        if len(self._upload_names) > MAX_NAMES:
+            self._upload_names.clear()
         missing = [upload_id for upload_id in wanted if upload_id not in self._upload_names]
         for start in range(0, len(missing), NAMES_BATCH):
             batch = missing[start : start + NAMES_BATCH]

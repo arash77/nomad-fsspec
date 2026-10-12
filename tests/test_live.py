@@ -5,7 +5,7 @@ from nomad_fsspec import NomadFileSystem
 
 pytestmark = pytest.mark.live
 
-DEMO_DATASET = "/wWgAnNZNQxOHLf97H62dgw"
+DEMO_DATASET = "/datasets/wWgAnNZNQxOHLf97H62dgw"
 DEMO_FILE = (
     f"{DEMO_DATASET}/Xa2LB__ESiKu-odRBPJhjA/nomad-demo-data/BrK_svSe/TBCC006.ABC/vasprun.xml.relax2"
 )
@@ -20,10 +20,10 @@ def fs():
     return NomadFileSystem(skip_instance_cache=True)
 
 
-def test_root_lists_public_datasets_by_name(fs):
-    root = fs.ls("/")
-    assert len(root) > 1000
-    assert any(entry["display_name"] == "demo example data" for entry in root)
+def test_public_datasets_are_listed_by_name(fs):
+    datasets = fs.ls("/datasets")
+    assert len(datasets) > 1000
+    assert any(entry["display_name"] == "demo example data" for entry in datasets)
 
 
 def test_demo_file_downloads_and_reads_in_parts(fs, tmp_path):
@@ -31,7 +31,9 @@ def test_demo_file_downloads_and_reads_in_parts(fs, tmp_path):
     assert fs.upload_names(path.rsplit("/", 1)[-1] for path in uploads) == {
         "Xa2LB__ESiKu-odRBPJhjA": "nomad-demo-data.zip"
     }
-    assert fs.search_uploads(DEMO_DATASET.strip("/"), "DEMO-data") == ["Xa2LB__ESiKu-odRBPJhjA"]
+    assert fs.search_uploads(DEMO_DATASET.rsplit("/", 1)[-1], "DEMO-data") == [
+        "Xa2LB__ESiKu-odRBPJhjA"
+    ]
     assert fs.info(DEMO_FILE)["size"] == 424235
     target = tmp_path / "vasprun.xml"
     fs.get_file(DEMO_FILE, str(target))

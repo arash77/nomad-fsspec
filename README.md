@@ -7,26 +7,29 @@ An [fsspec](https://filesystem-spec.readthedocs.io) filesystem for the raw data 
 import fsspec
 
 fs = fsspec.filesystem("nomad")  # https://nomad-lab.eu/prod/v1 by default
-fs.ls("/")  # public datasets
-fs.ls("/wWgAnNZNQxOHLf97H62dgw", detail=False)  # the uploads of one dataset, by id
+fs.ls("/")  # two folders: /datasets and /uploads
+fs.ls("/datasets")  # public datasets
+fs.ls("/datasets/wWgAnNZNQxOHLf97H62dgw", detail=False)  # the uploads of one dataset, by id
 fs.upload_names(["Xa2LB__ESiKu-odRBPJhjA"])  # {"Xa2LB__ESiKu-odRBPJhjA": "nomad-demo-data.zip"}
 fs.get_file(
-    "/wWgAnNZNQxOHLf97H62dgw/Xa2LB__ESiKu-odRBPJhjA/nomad-demo-data/BrK_svSe/TBCC006.ABC/vasprun.xml.relax2",
+    "/datasets/wWgAnNZNQxOHLf97H62dgw/Xa2LB__ESiKu-odRBPJhjA/nomad-demo-data/BrK_svSe/TBCC006.ABC/vasprun.xml.relax2",
     "vasprun.xml",
 )
 ```
 
-Paths are `/<dataset id>/<upload id>/<path inside the upload>`, and only public data is listed.
-Datasets have their names in `display_name`. Uploads inside a dataset are listed by id, since
-naming all uploads of a large dataset at once makes NOMAD time out; `upload_names` looks names up
-25 at a time and keeps them, and `search_uploads` finds the ids of uploads by name.
+The top level has two folders, so a path means the same thing with or without a token:
 
-With a token, the top level lists your uploads and those shared with you, published or not, as
-NOMAD's uploads page does. Paths are then `/<upload id>/<path inside the upload>`:
+- `/datasets/<dataset id>/<upload id>/<path inside the upload>` for public datasets. Datasets
+  have their names in `display_name`. Uploads inside a dataset are listed by id, since naming
+  all uploads of a large dataset at once makes NOMAD time out; `upload_names` looks names up
+  25 at a time and keeps them, and `search_uploads` finds the ids of uploads by name.
+- `/uploads/<upload id>/<path inside the upload>` for your uploads and those shared with you,
+  published or not, as NOMAD's uploads page lists them. Listing `/uploads` needs a token.
+  Published uploads can be read through it without one.
 
 ```python
 fs = fsspec.filesystem("nomad", token="...")
-fs.ls("/")  # your uploads, with their names in display_name
+fs.ls("/uploads")  # your uploads, with their names in display_name
 ```
 
 A [personal access token](https://docs.nomad-lab.eu/howto/manage/program/auth.html) with the

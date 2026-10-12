@@ -40,3 +40,11 @@ def test_demo_file_downloads_and_reads_in_parts(fs, tmp_path):
     data = target.read_bytes()
     assert len(data) == 424235
     assert fs.cat_file(DEMO_FILE, start=100, end=150) == data[100:150]
+
+
+def test_my_uploads_reads_a_published_upload_and_refuses_a_bad_token(fs):
+    as_upload = DEMO_FILE.replace(DEMO_DATASET, "/uploads")
+    assert fs.cat_file(as_upload, start=100, end=150) == fs.cat_file(DEMO_FILE, start=100, end=150)
+    bad = NomadFileSystem(token="not-a-token", skip_instance_cache=True)
+    with pytest.raises(PermissionError, match="token is invalid"):
+        bad.ls("/uploads")

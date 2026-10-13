@@ -1,3 +1,7 @@
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 import requests
 import responses
@@ -5,7 +9,7 @@ from responses import registries
 from urllib3.response import HTTPResponse
 
 from nomad_fsspec.client import NomadClient
-from nomad_fsspec.errors import NomadError
+from nomad_fsspec.errors import NomadError, NomadTimeout
 
 API = "https://nomad.example.org/oasis/api/v1"
 
@@ -68,6 +72,26 @@ def test_retry_waits_are_capped_and_odd_retry_after_values_are_tolerated():
 def test_a_slow_answer_is_not_requested_again():
     retry = NomadClient(API).session.get_adapter(API).max_retries
     assert retry.read == 0
+
+
+def test_a_slow_answer_is_a_timeout():
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(1)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = NomadClient(f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(NomadTimeout, match="did not answer /x in time$"):
+            client.get_json(["x"], timeout=(2, 0.2))
+    finally:
+        server.shutdown()
 
 
 def test_credentials_in_the_base_url_stay_out_of_messages():

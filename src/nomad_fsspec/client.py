@@ -5,10 +5,10 @@ from urllib.parse import quote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.exceptions import InvalidHeader
+from urllib3.exceptions import InvalidHeader, ReadTimeoutError
 from urllib3.util.retry import Retry
 
-from .errors import NomadError
+from .errors import NomadError, NomadTimeout
 
 DEFAULT_BASE_URL = "https://nomad-lab.eu/prod/v1"
 API_PATH = "/api/v1"
@@ -72,8 +72,13 @@ class NomadClient:
     def url(self, parts: list[str]) -> str:
         return "/".join([self.api_url, *(quote(part, safe="") for part in parts)])
 
-    def get_json(self, parts: list[str], params: dict[str, Any] | None = None) -> dict[str, Any]:
-        with self.request("GET", parts, params=params) as response:
+    def get_json(
+        self,
+        parts: list[str],
+        params: dict[str, Any] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        with self.request("GET", parts, params=params, timeout=timeout or self.timeout) as response:
             return self._json(response)
 
     def post_json(self, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
@@ -106,14 +111,17 @@ class NomadClient:
     @contextmanager
     def request(self, method: str, parts: list[str], **kwargs: Any) -> Iterator[requests.Response]:
         label = "/" + "/".join(parts)
+        kwargs.setdefault("timeout", self.timeout)
         try:
             # NOMAD's API does not redirect, and a redirect could lead to an address nobody checked
             with self.session.request(
-                method, self.url(parts), timeout=self.timeout, allow_redirects=False, **kwargs
+                method, self.url(parts), allow_redirects=False, **kwargs
             ) as response:
                 self._raise_for_status(response, label)
                 yield response
         except requests.RequestException as e:
+            if _timed_out(e):
+                raise NomadTimeout(f"NOMAD at {self.host} did not answer {label} in time") from e
             raise NomadError(f"Request to NOMAD at {self.host} failed: {e}") from e
 
     def _raise_for_status(self, response: requests.Response, label: str) -> None:
@@ -148,6 +156,12 @@ class NomadClient:
         if not isinstance(body, dict):
             raise NomadError(message)
         return body
+
+
+def _timed_out(error: requests.RequestException) -> bool:
+    # with no read retries, urllib3 reports a read timeout inside a MaxRetryError
+    reason = getattr(error.args[0], "reason", None) if error.args else None
+    return isinstance(error, requests.Timeout) or isinstance(reason, ReadTimeoutError)
 
 
 def _detail(response: requests.Response) -> str:

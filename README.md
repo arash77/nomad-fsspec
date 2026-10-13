@@ -37,8 +37,10 @@ which takes one or two byte ranges of `/uploads/<upload id>/raw` without the tok
 uploads with hundreds of thousands of files. NOMAD's own folder listing adds up every size below a
 folder and can take a minute on such uploads. The listing is kept for the life of the process and
 shared, since published uploads do not change: about 19 bytes per file, so 7 MB for the largest
-public upload, and up to 64 MB in all, the oldest dropped first. Smaller, unpublished and embargoed
-uploads are listed folder by folder. NOMAD allows one new connection to the ZIP route per client
+public upload, and up to 64 MB in all, the oldest dropped first. Smaller published uploads are
+listed folder by folder, unless NOMAD takes more than 5 seconds to answer, which it can the first
+time it reads an upload; their ZIP is then read instead. Unpublished and embargoed uploads are
+always listed folder by folder. NOMAD allows one new connection to the ZIP route per client
 every 5 seconds; a busy answer is retried.
 
 A [personal access token](https://docs.nomad-lab.eu/howto/manage/program/auth.html) with the

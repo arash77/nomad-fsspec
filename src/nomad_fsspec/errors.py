@@ -4,3 +4,7 @@ class NomadError(Exception):
     Not an ``OSError`` on purpose: fsspec's ``walk`` skips folders that raise ``OSError``, which
     would show a failed request as an empty folder.
     """
+
+
+class NomadTimeout(NomadError):
+    """NOMAD did not answer in time."""

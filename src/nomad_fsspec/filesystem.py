@@ -13,7 +13,7 @@ from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.utils import isfilelike
 
 from .client import DEFAULT_BASE_URL, NomadClient, RangeUnavailable
-from .errors import NomadError
+from .errors import NomadError, NomadTimeout
 from .zipindex import Tree, ZipIndexError, children, read_tree, size_of
 
 # NOMAD reads a whole directory for every page, so ask for all of it at once
@@ -29,6 +29,9 @@ UPLOADS = "uploads"
 # smaller uploads list quickly folder by folder, and every ZIP read waits its turn: NOMAD allows
 # one every 5 seconds per client
 ZIP_MIN_ENTRIES = 300
+# how long NOMAD may take to list a folder of a smaller published upload before its ZIP is read;
+# NOMAD can take 20 seconds the first time it reads an upload, the ZIP a second or two
+QUICK_LISTING_SECONDS = 5
 # memory for the file lists kept from ZIPs, across all uploads; the largest public upload on
 # nomad-lab.eu (394,495 files) takes about 10 MB
 MAX_ZIP_BYTES = 64 << 20
@@ -77,6 +80,7 @@ class NomadFileSystem(AbstractFileSystem):
         self._has_token = bool(token)
         self._upload_names: dict[str, str | None] = {}
         self._no_zip: set[str] = set()
+        self._small: set[str] = set()
 
     @classmethod
     def _strip_protocol(cls, path: Any) -> Any:
@@ -101,6 +105,7 @@ class NomadFileSystem(AbstractFileSystem):
             self.dircache.clear()
             self._upload_names.clear()
             self._no_zip.clear()
+            self._small.clear()
             with _shared_lock:
                 for key in [key for key in _zip_trees if key[0] == self.client.api_url]:
                     del _zip_trees[key]
@@ -322,13 +327,25 @@ class NomadFileSystem(AbstractFileSystem):
         self, path: str, upload_id: str, inner: list[str]
     ) -> list[dict[str, Any]]:
         tree = self._zip_tree(upload_id)
+        if tree is None and upload_id in self._small:
+            try:
+                return self._list_by_folder(path, upload_id, inner, quick=True)
+            except NomadTimeout:
+                tree = self._zip_tree(upload_id, small_too=True)
         if tree is not None:
             return _from_tree(tree, path, inner)
+        return self._list_by_folder(path, upload_id, inner)
+
+    def _list_by_folder(
+        self, path: str, upload_id: str, inner: list[str], quick: bool = False
+    ) -> list[dict[str, Any]]:
+        timeout = (self.client.timeout[0], QUICK_LISTING_SECONDS) if quick else None
         entries: list[dict[str, Any]] = []
         offset = 0
         while True:
             params = {"page_size": PAGE_SIZE, "page_offset": offset}
-            body = self.client.get_json(["uploads", upload_id, "rawdir", *inner, ""], params)
+            parts = ["uploads", upload_id, "rawdir", *inner, ""]
+            body = self.client.get_json(parts, params, timeout)
             if "directory_metadata" not in body:
                 size = (body.get("file_metadata") or {}).get("size")
                 return [{"name": path, "size": int(size or 0), "type": "file"}]
@@ -348,16 +365,27 @@ class NomadFileSystem(AbstractFileSystem):
             if not content or offset >= body["pagination"]["total"]:
                 return entries
 
-    def _zip_tree(self, upload_id: str) -> Tree | None:
-        """The files of a large published upload from its ZIP, or None to list it by folder."""
+    def _zip_tree(self, upload_id: str, small_too: bool = False) -> Tree | None:
+        """The files of a published upload from its ZIP, or None to list it by folder.
+
+        A smaller upload is read from its ZIP only with ``small_too``.
+        """
         key = (self.client.api_url, upload_id)
         with _shared_lock:
             kept = _zip_trees.get(key)
             if kept is not None:
                 _zip_trees.move_to_end(key)
                 return kept[0]
-        if upload_id in self._no_zip or not self._wants_zip(upload_id):
-            self._no_zip.add(upload_id)
+        if upload_id in self._no_zip:
+            return None
+        if upload_id not in self._small:
+            public, entries = self._upload_facts(upload_id)
+            if not public:
+                self._no_zip.add(upload_id)
+                return None
+            if entries <= ZIP_MIN_ENTRIES:
+                self._small.add(upload_id)
+        if upload_id in self._small and not small_too:
             return None
         parts = ["uploads", upload_id, "raw"]
         try:
@@ -382,14 +410,15 @@ class NomadFileSystem(AbstractFileSystem):
                     in_use -= dropped
         return tree
 
-    def _wants_zip(self, upload_id: str) -> bool:
+    def _upload_facts(self, upload_id: str) -> tuple[bool, int]:
+        """Whether anyone may read the upload's ZIP, and its number of entries."""
         # only a published upload without an embargo has a ZIP that anyone may read
         try:
             upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
         except (NomadError, OSError):
-            return False
+            return False, 0
         public = bool(upload.get("published")) and not upload.get("with_embargo")
-        return public and (upload.get("entries") or 0) > ZIP_MIN_ENTRIES
+        return public, int(upload.get("entries") or 0)
 
     def _aggregate(self, quantity: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         buckets: list[dict[str, Any]] = []

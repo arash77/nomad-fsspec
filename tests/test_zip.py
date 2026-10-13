@@ -4,6 +4,7 @@ import struct
 import zipfile
 
 import pytest
+import requests
 import responses
 
 from nomad_fsspec import NomadFileSystem, filesystem, zipindex
@@ -115,6 +116,26 @@ def test_small_unpublished_or_unreadable_uploads_are_listed_folder_by_folder():
     # a missing ZIP is not asked for again, but a busy NOMAD is
     assert zip_reads("up2") == before[0] == 1
     assert zip_reads("up3") > before[1]
+
+
+@responses.activate
+def test_a_small_upload_is_read_from_its_zip_when_nomad_is_slow_to_list_it():
+    seen: list[dict] = []
+    serve_zip(make_zip({"sub/a.txt": b"abc", "sub/deeper/b.txt": b"b"}), seen)
+    responses.replace(
+        responses.GET, f"{API}/uploads/up1", json={"data": {"published": True, "entries": 3}}
+    )
+    responses.get(f"{API}/uploads/up1/rawdir/sub/", body=requests.exceptions.ReadTimeout())
+    fs = NomadFileSystem(base_url=BASE, skip_instance_cache=True)
+    assert fs.ls("/datasets/ds1/up1/sub", detail=False) == [
+        "/datasets/ds1/up1/sub/a.txt",
+        "/datasets/ds1/up1/sub/deeper",
+    ]
+    assert fs.ls("/datasets/ds1/up1/sub/deeper", detail=False) == [
+        "/datasets/ds1/up1/sub/deeper/b.txt"
+    ]
+    folder_listings = [call for call in responses.calls if "/rawdir/" in call.request.url]
+    assert len(folder_listings) == 1 and len(seen) == 1
 
 
 @responses.activate

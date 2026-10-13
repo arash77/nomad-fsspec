@@ -15,6 +15,14 @@ API_PATH = "/api/v1"
 MAX_RETRY_AFTER = 10
 
 
+class RangeUnavailable(Exception):
+    """The byte range could not be read; ``lasting`` when asking again would not help."""
+
+    def __init__(self, message: str, lasting: bool) -> None:
+        super().__init__(message)
+        self.lasting = lasting
+
+
 class _Retry(Retry):
     """Honour NOMAD's Retry-After, but never wait long or fail on an odd value."""
 
@@ -71,6 +79,29 @@ class NomadClient:
     def post_json(self, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
         with self.request("POST", parts, json=body) as response:
             return self._json(response)
+
+    def read_range(self, parts: list[str], byte_range: str) -> tuple[bytes, int]:
+        """Read an HTTP byte range without the token; return the bytes and the full size.
+
+        Without the token the answer is the same for everyone, so callers may share it.
+        """
+        try:
+            with self.session.get(
+                self.url(parts),
+                # None drops the session's Authorization header for this request
+                headers={"Range": byte_range, "Authorization": None},
+                timeout=self.timeout,
+                allow_redirects=False,
+                stream=True,
+            ) as response:
+                total = response.headers.get("Content-Range", "").rpartition("/")[2]
+                if response.status_code == 206 and total.isdigit():
+                    return response.content, int(total)
+                # anything else is left unread: a server that ignores the range sends everything
+                busy = response.status_code == 429 or response.status_code >= 500
+                raise RangeUnavailable(f"HTTP {response.status_code}", lasting=not busy)
+        except requests.RequestException as e:
+            raise RangeUnavailable(str(e), lasting=False) from e
 
     @contextmanager
     def request(self, method: str, parts: list[str], **kwargs: Any) -> Iterator[requests.Response]:

@@ -12,6 +12,12 @@ BASE = "https://nomad.example.org/oasis"
 API = f"{BASE}/api/v1"
 
 
+@pytest.fixture(autouse=True)
+def list_folder_by_folder(monkeypatch):
+    # these tests are about NOMAD's own folder listing; test_zip.py covers listing from the ZIP
+    monkeypatch.setattr(NomadFileSystem, "_zip_tree", lambda self, upload_id, public: None)
+
+
 def make_fs() -> NomadFileSystem:
     return NomadFileSystem(base_url=BASE, skip_instance_cache=True)
 

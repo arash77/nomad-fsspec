@@ -90,6 +90,22 @@ def test_public_datasets_are_listed_by_name_and_cached():
     assert len(responses.calls) == 2
 
 
+@responses.activate
+def test_instances_share_the_public_datasets_unless_listings_are_not_kept():
+    responses.post(f"{API}/entries/query", json=aggregation("ds1"))
+    responses.get(
+        f"{API}/datasets/", json={"pagination": {"total": 1}, "data": [{"dataset_id": "ds1"}]}
+    )
+    for _ in range(2):
+        assert make_fs().ls("/datasets", detail=False) == ["/datasets/ds1"]
+    assert len(responses.calls) == 2
+    uncached = NomadFileSystem(base_url=BASE, use_listings_cache=False, skip_instance_cache=True)
+    uncached.ls("/datasets")
+    make_fs().invalidate_cache()
+    make_fs().ls("/datasets")
+    assert len(responses.calls) == 6
+
+
 @responses.activate(registry=registries.OrderedRegistry)
 def test_a_dataset_lists_its_uploads_by_id_across_pages(monkeypatch):
     monkeypatch.setattr(filesystem, "AGGREGATION_PAGE_SIZE", 2)

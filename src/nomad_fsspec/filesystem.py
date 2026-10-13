@@ -1,6 +1,7 @@
 import errno
 import os
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -30,11 +31,15 @@ UPLOADS = "uploads"
 MAX_ZIP_FILES = 500_000
 # the largest public upload on nomad-lab.eu has a central directory of 34 MB
 MAX_ZIP_DIRECTORY = 128 << 20
+# how long the shared list of public datasets is kept when listings do not expire
+SHARED_DATASETS_SECONDS = 300
 
 # folders of an upload ("" is its top), each mapped to its children: a size, or None for a folder
 Tree = dict[str, dict[str, int | None]]
 # published uploads never change and their ZIPs are read without a token, so instances share them
 _zip_trees: OrderedDict[tuple[str, str], tuple[Tree, int]] = OrderedDict()
+# the public datasets are asked for as owner "public" whatever the token, so instances share them
+_shared_datasets: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _shared_lock = threading.Lock()
 
 
@@ -98,6 +103,7 @@ class NomadFileSystem(AbstractFileSystem):
             with _shared_lock:
                 for key in [key for key in _zip_trees if key[0] == self.client.api_url]:
                     del _zip_trees[key]
+                _shared_datasets.pop(self.client.api_url, None)
         else:
             self.dircache.pop(self._strip_protocol(path).rstrip("/"), None)
 
@@ -259,15 +265,27 @@ class NomadFileSystem(AbstractFileSystem):
         return self._list_dataset_uploads(parts[1])
 
     def _list_datasets(self) -> list[dict[str, Any]]:
+        # each thread has its own instance, so its own listings; this one costs a second or two
+        share = self.dircache.use_listings_cache
+        lifetime = self.dircache.listings_expiry_time or SHARED_DATASETS_SECONDS
+        if share:
+            with _shared_lock:
+                kept = _shared_datasets.get(self.client.api_url)
+            if kept is not None and time.monotonic() - kept[0] < lifetime:
+                return list(kept[1])
         public = {bucket["value"] for bucket in self._aggregate("datasets.dataset_id", {})}
         params = {"order_by": "dataset_name", "order": "asc"}
-        return _by_name(
+        datasets = _by_name(
             [
                 _directory(f"/{DATASETS}/{dataset['dataset_id']}", dataset.get("dataset_name"))
                 for dataset in self._pages(["datasets", ""], params)
                 if dataset["dataset_id"] in public
             ]
         )
+        if share:
+            with _shared_lock:
+                _shared_datasets[self.client.api_url] = (time.monotonic(), datasets)
+        return list(datasets)
 
     def _list_own_uploads(self) -> list[dict[str, Any]]:
         if not self._has_token:

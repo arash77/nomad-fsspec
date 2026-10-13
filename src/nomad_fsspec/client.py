@@ -132,6 +132,9 @@ class NomadClient:
             raise PermissionError(f"NOMAD at {self.host} refused access to {label}: {detail}")
         if response.status_code == 400 and "is a directory" in detail.lower():
             raise IsADirectoryError(label)
+        if response.status_code == 504:
+            # NOMAD's gateway gives up after a minute and answers with a page of HTML
+            raise NomadError(f"NOMAD at {self.host} took too long to answer {label}")
         raise NomadError(
             f"NOMAD at {self.host} answered HTTP {response.status_code} for {label}: {detail}"
         )

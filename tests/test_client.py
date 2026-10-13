@@ -90,3 +90,10 @@ def test_redirects_are_not_followed():
     with pytest.raises(NomadError, match="redirected /x to http://10.0.0.1/x"):
         NomadClient(API).get_json(["x"])
     assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_a_gateway_timeout_is_said_plainly():
+    responses.get(f"{API}/x", status=504, body="<html>504 Gateway Time-out</html>")
+    with pytest.raises(NomadError, match="took too long to answer /x$"):
+        NomadClient(API).get_json(["x"])

@@ -10,6 +10,7 @@ from typing import IO, Any
 
 from fsspec import AbstractFileSystem
 from fsspec.callbacks import DEFAULT_CALLBACK
+from fsspec.dircache import DirCache
 from fsspec.utils import isfilelike
 
 from .client import DEFAULT_BASE_URL, NomadClient, RangeUnavailable
@@ -76,6 +77,7 @@ class NomadFileSystem(AbstractFileSystem):
         **storage_options: Any,
     ) -> None:
         super().__init__(**storage_options)
+        self.dircache = _Listings(**storage_options)
         self.client = NomadClient(base_url, timeout, token)
         self._has_token = bool(token)
         self._upload_names: dict[str, str | None] = {}
@@ -97,7 +99,10 @@ class NomadFileSystem(AbstractFileSystem):
         if entries is None:
             with _named(path):
                 entries = self._fetch(path)
-            self.dircache[key] = entries
+            located = self._locate(path)
+            # a folder of a kept ZIP is listed from it again rather than kept a second time
+            if located is None or self._kept_tree(located[0]) is None:
+                self.dircache[key] = entries
         return entries if detail else [entry["name"] for entry in entries]
 
     def invalidate_cache(self, path: str | None = None) -> None:
@@ -232,6 +237,11 @@ class NomadFileSystem(AbstractFileSystem):
         return upload_ids
 
     def _cached_type(self, path: str) -> str | None:
+        located = self._locate(path)
+        if located is not None:
+            tree = self._kept_tree(located[0])
+            if tree is not None and "/".join(located[1]) in tree:
+                return "directory"
         listing = self.dircache.get(self._parent(path).rstrip("/")) or []
         return next((entry["type"] for entry in listing if entry["name"] == path), None)
 
@@ -370,12 +380,9 @@ class NomadFileSystem(AbstractFileSystem):
 
         A smaller upload is read from its ZIP only with ``small_too``.
         """
-        key = (self.client.api_url, upload_id)
-        with _shared_lock:
-            kept = _zip_trees.get(key)
-            if kept is not None:
-                _zip_trees.move_to_end(key)
-                return kept[0]
+        kept = self._kept_tree(upload_id)
+        if kept is not None:
+            return kept
         if upload_id in self._no_zip:
             return None
         if upload_id not in self._small:
@@ -403,12 +410,21 @@ class NomadFileSystem(AbstractFileSystem):
         size = size_of(tree)
         if size <= MAX_ZIP_BYTES:
             with _shared_lock:
-                _zip_trees[key] = (tree, size)
+                _zip_trees[(self.client.api_url, upload_id)] = (tree, size)
                 in_use = sum(kept_size for _, kept_size in _zip_trees.values())
                 while in_use > MAX_ZIP_BYTES:
                     _, (_, dropped) = _zip_trees.popitem(last=False)
                     in_use -= dropped
         return tree
+
+    def _kept_tree(self, upload_id: str) -> Tree | None:
+        key = (self.client.api_url, upload_id)
+        with _shared_lock:
+            kept = _zip_trees.get(key)
+            if kept is None:
+                return None
+            _zip_trees.move_to_end(key)
+            return kept[0]
 
     def _upload_facts(self, upload_id: str) -> tuple[bool, int]:
         """Whether anyone may read the upload's ZIP, and its number of entries."""
@@ -445,6 +461,51 @@ class NomadFileSystem(AbstractFileSystem):
             after = (result.get("pagination") or {}).get("next_page_after_value")
             if after is None:
                 return buckets
+
+
+class _Listings(DirCache):
+    """fsspec's listing cache, with ``max_paths`` and ``listings_expiry_time`` freeing memory.
+
+    fsspec's own drops a listing past either only when that listing is asked for again, so an
+    instance that lists many folders keeps them all.
+    """
+
+    def __init__(
+        self,
+        use_listings_cache: bool = True,
+        listings_expiry_time: float | None = None,
+        max_paths: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(use_listings_cache, listings_expiry_time)
+        self.max_paths = max_paths
+        # oldest first, by when each listing was set
+        self._cache: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
+
+    def __getitem__(self, item: str) -> list[dict[str, Any]]:
+        stored, listing = self._cache[item]
+        if self._expired(stored):
+            del self._cache[item]
+            raise KeyError(item)
+        return listing
+
+    def __setitem__(self, key: str, value: list[dict[str, Any]]) -> None:
+        if not self.use_listings_cache:
+            return
+        self._cache.pop(key, None)
+        self._cache[key] = (time.monotonic(), value)
+        while self._cache and (
+            (self.max_paths and len(self._cache) > self.max_paths)
+            or self._expired(next(iter(self._cache.values()))[0])
+        ):
+            self._cache.popitem(last=False)
+
+    def _expired(self, stored: float) -> bool:
+        expiry = self.listings_expiry_time
+        return expiry is not None and time.monotonic() - stored > expiry
+
+    def __reduce__(self) -> Any:
+        return type(self), (self.use_listings_cache, self.listings_expiry_time, self.max_paths)
 
 
 def _split(path: str) -> list[str]:

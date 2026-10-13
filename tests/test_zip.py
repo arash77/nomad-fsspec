@@ -45,7 +45,7 @@ def serve_zip(data: bytes, seen: list[dict]) -> None:
 
 
 @responses.activate
-def test_a_published_upload_is_listed_from_its_zip_and_kept():
+def test_a_published_upload_is_listed_from_its_zip_and_kept(tmp_path):
     seen: list[dict] = []
     serve_zip(
         make_zip({"a.txt": b"abc", "sub/b.txt": b"bb", "sub/deep/c.txt": b"c"}, ("empty/",)), seen
@@ -69,6 +69,12 @@ def test_a_published_upload_is_listed_from_its_zip_and_kept():
         "/uploads/up1/sub/deep",
     ]
     assert len(seen) == 1 and "Authorization" not in seen[0]
+    # a folder is known from the kept list without a request, and no instance keeps a copy
+    target = tmp_path / "x"
+    target.write_bytes(b"")
+    with pytest.raises(IsADirectoryError):
+        other.get_file("/uploads/up1/sub", str(target))
+    assert len(fs.dircache) == len(other.dircache) == 0
 
 
 @responses.activate

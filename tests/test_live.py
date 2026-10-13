@@ -42,6 +42,12 @@ def test_demo_file_downloads_and_reads_in_parts(fs, tmp_path):
     assert fs.cat_file(DEMO_FILE, start=100, end=150) == data[100:150]
 
 
+def test_a_folder_is_refused_by_nomad_when_nothing_is_listed(fs, tmp_path):
+    folder = DEMO_FILE.rsplit("/", 1)[0]
+    with pytest.raises(IsADirectoryError):
+        NomadFileSystem(skip_instance_cache=True).get_file(folder, str(tmp_path / "x"))
+
+
 def test_my_uploads_reads_a_published_upload_and_refuses_a_bad_token(fs):
     as_upload = DEMO_FILE.replace(DEMO_DATASET, "/uploads")
     assert fs.cat_file(as_upload, start=100, end=150) == fs.cat_file(DEMO_FILE, start=100, end=150)

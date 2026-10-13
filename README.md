@@ -43,6 +43,10 @@ time it reads an upload; their ZIP is then read instead. Unpublished and embargo
 always listed folder by folder. NOMAD allows one new connection to the ZIP route per client
 every 5 seconds; a busy answer is retried.
 
+Other listings are kept by each instance in fsspec's listing cache, where `max_paths` and
+`listings_expiry_time` drop old listings as new ones come in. fsspec's own cache drops them only
+when they are asked for again.
+
 A [personal access token](https://docs.nomad-lab.eu/howto/manage/program/auth.html) with the
 `uploads:read` scope is enough. To use a NOMAD Oasis, pass `base_url`:
 

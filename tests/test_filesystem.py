@@ -1,4 +1,5 @@
 import io
+import time
 
 import fsspec.callbacks
 import pytest
@@ -387,6 +388,23 @@ def test_refresh_and_invalidate_cache_fetch_again():
     fs.invalidate_cache()
     fs.ls("/datasets/ds1/up1")
     assert len(responses.calls) == 4
+
+
+@responses.activate
+def test_listings_past_max_paths_or_expired_are_dropped(monkeypatch):
+    listing = rawdir({"name": "a", "is_file": True})
+    for upload in ("up1", "up2", "up3"):
+        responses.get(f"{API}/uploads/{upload}/rawdir/", json=listing)
+    fs = NomadFileSystem(
+        base_url=BASE, max_paths=2, listings_expiry_time=60, skip_instance_cache=True
+    )
+    for upload in ("up1", "up2", "up3"):
+        fs.ls(f"/datasets/ds1/{upload}")
+    assert list(fs.dircache) == ["/datasets/ds1/up2", "/datasets/ds1/up3"]
+    later = time.monotonic() + 61
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    fs.ls("/datasets/ds1/up1")
+    assert list(fs.dircache) == ["/datasets/ds1/up1"]
 
 
 @responses.activate

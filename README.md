@@ -22,7 +22,7 @@ The top level has two folders, so a path means the same thing with or without a 
 - `/datasets/<dataset id>/<upload id>/<path inside the upload>` for public datasets. Datasets
   have their names in `display_name`. Uploads inside a dataset are listed by id, since naming
   all uploads of a large dataset at once makes NOMAD time out; `upload_names` looks names up
-  25 at a time and keeps them, and `search_uploads` finds the ids of uploads by name.
+  8 at a time and keeps them, and `search_uploads` finds the ids of uploads by name.
 - `/uploads/<upload id>/<path inside the upload>` for your uploads and those shared with you,
   published or not, as NOMAD's uploads page lists them. Listing `/uploads` needs a token.
   Published uploads can be read through it without one.

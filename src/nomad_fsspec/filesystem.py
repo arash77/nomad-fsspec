@@ -3,6 +3,7 @@ import os
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import IO, Any
 
@@ -17,8 +18,8 @@ from .zipindex import ZipIndexError, list_files
 # NOMAD reads a whole directory for every page, so ask for all of it at once
 PAGE_SIZE = 10000
 AGGREGATION_PAGE_SIZE = 2500
-# NOMAD takes about 0.7 s to name 25 uploads but 7 s to name 100
-NAMES_BATCH = 25
+# uploads named at once; one request each takes about 0.2 s
+NAMES_WORKERS = 8
 # upload names kept before they are dropped and asked for again
 MAX_NAMES = 10000
 CHUNK_SIZE = 2**20
@@ -170,21 +171,32 @@ class NomadFileSystem(AbstractFileSystem):
         return super()._open(path, mode=mode, size=info["size"], **kwargs)
 
     def upload_names(self, upload_ids: Iterable[str]) -> dict[str, str]:
-        """Look up the names of public uploads, which a dataset's listing leaves out.
+        """Look up the names of uploads, which a dataset's listing leaves out.
 
-        Names are kept, so only uploads not asked about before cost a request.
+        Each upload is one request, several at a time. Names are kept, so only uploads not asked
+        about before cost a request; an upload that could not be asked about is left out.
         """
         wanted = list(dict.fromkeys(upload_ids))
         if len(self._upload_names) > MAX_NAMES:
             self._upload_names.clear()
         missing = [upload_id for upload_id in wanted if upload_id not in self._upload_names]
-        for start in range(0, len(missing), NAMES_BATCH):
-            batch = missing[start : start + NAMES_BATCH]
-            names: dict[str, str | None] = dict.fromkeys(batch)
-            for bucket in self._aggregate("upload_id", {"upload_id:any": batch}, ["upload_name"]):
-                names[bucket["value"]] = (bucket.get("entries") or [{}])[0].get("upload_name")
-            self._upload_names.update(names)
-        return {upload_id: name for upload_id in wanted if (name := self._upload_names[upload_id])}
+        if missing:
+            with ThreadPoolExecutor(min(NAMES_WORKERS, len(missing))) as pool:
+                for upload_id, (known, name) in zip(
+                    missing, pool.map(self._upload_name, missing), strict=True
+                ):
+                    if known:
+                        self._upload_names[upload_id] = name
+        return {
+            upload_id: name for upload_id in wanted if (name := self._upload_names.get(upload_id))
+        }
+
+    def _upload_name(self, upload_id: str) -> tuple[bool, str | None]:
+        try:
+            upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
+        except (NomadError, OSError):
+            return False, None
+        return True, upload.get("upload_name")
 
     def search_uploads(self, dataset_id: str, text: str) -> list[str]:
         """Find the public uploads of a dataset whose name contains ``text``, ignoring case.
@@ -360,9 +372,7 @@ class NomadFileSystem(AbstractFileSystem):
             return False
         return bool(upload.get("published")) and not upload.get("with_embargo")
 
-    def _aggregate(
-        self, quantity: str, query: dict[str, Any], include: list[str] | None = None
-    ) -> list[dict[str, Any]]:
+    def _aggregate(self, quantity: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         buckets: list[dict[str, Any]] = []
         after = None
         while True:
@@ -370,8 +380,6 @@ class NomadFileSystem(AbstractFileSystem):
             if after is not None:
                 pagination["page_after_value"] = after
             terms: dict[str, Any] = {"quantity": quantity, "pagination": pagination}
-            if include:
-                terms["entries"] = {"size": 1, "required": {"include": include}}
             body = self.client.post_json(
                 ["entries", "query"],
                 {

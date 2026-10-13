@@ -22,13 +22,11 @@ def make_fs() -> NomadFileSystem:
     return NomadFileSystem(base_url=BASE, skip_instance_cache=True)
 
 
-def aggregation_body(quantity, query, page_size, after=None, include=None):
+def aggregation_body(quantity, query, page_size, after=None):
     pagination = {"page_size": page_size}
     if after is not None:
         pagination["page_after_value"] = after
     terms = {"quantity": quantity, "pagination": pagination}
-    if include:
-        terms["entries"] = {"size": 1, "required": {"include": include}}
     return {
         "owner": "public",
         "query": query,
@@ -37,13 +35,8 @@ def aggregation_body(quantity, query, page_size, after=None, include=None):
     }
 
 
-def aggregation(*values, names=None, after=None):
-    data = []
-    for value in values:
-        bucket = {"value": value, "count": 1}
-        if names and value in names:
-            bucket["entries"] = [{"upload_name": names[value]}]
-        data.append(bucket)
+def aggregation(*values, after=None):
+    data = [{"value": value, "count": 1} for value in values]
     terms = {"data": data, "pagination": {"next_page_after_value": after}}
     return {"aggregations": {"buckets": {"terms": terms}}}
 
@@ -119,29 +112,24 @@ def test_a_dataset_lists_its_uploads_by_id_across_pages(monkeypatch):
     ]
 
 
-@responses.activate(registry=registries.OrderedRegistry)
-def test_upload_names_are_asked_for_in_batches_and_kept(monkeypatch):
-    monkeypatch.setattr(filesystem, "NAMES_BATCH", 2)
-    include = ["upload_name"]
-    for batch, names in (
-        (["up1", "up2"], {"up1": "a.zip", "up2": "b.zip"}),
-        (["up3"], {}),
-    ):
-        body = aggregation_body("upload_id", {"upload_id:any": batch}, 2500, include=include)
-        responses.post(
-            f"{API}/entries/query",
-            match=[matchers.json_params_matcher(body)],
-            json=aggregation(*names, names=names),
-        )
+@responses.activate
+def test_upload_names_are_asked_for_one_by_one_and_kept(monkeypatch):
+    responses.get(f"{API}/uploads/up1", json={"data": {"upload_name": "a.zip"}})
+    responses.get(f"{API}/uploads/up2", json={"data": {}})
+    responses.get(f"{API}/uploads/up3", status=500, json={"detail": "boom"})
     fs = make_fs()
-    assert fs.upload_names(["up1", "up2", "up3"]) == {"up1": "a.zip", "up2": "b.zip"}
-    assert fs.upload_names(["up3", "up2"]) == {"up2": "b.zip"}
-    assert len(responses.calls) == 2
+    assert fs.upload_names(["up1", "up2", "up3"]) == {"up1": "a.zip"}
+
+    def asked(upload):
+        return sum(call.request.url == f"{API}/uploads/{upload}" for call in responses.calls)
+
+    # an upload without a name is kept as such; one that failed is asked about again
+    assert fs.upload_names(["up3", "up2", "up1"]) == {"up1": "a.zip"}
+    assert (asked("up1"), asked("up2")) == (1, 1) and asked("up3") > 1
     # past the limit, the kept names are dropped and asked for again
-    monkeypatch.setattr(filesystem, "MAX_NAMES", 2)
-    responses.post(f"{API}/entries/query", json=aggregation("up2", names={"up2": "b.zip"}))
-    assert fs.upload_names(["up2"]) == {"up2": "b.zip"}
-    assert len(responses.calls) == 3
+    monkeypatch.setattr(filesystem, "MAX_NAMES", 1)
+    assert fs.upload_names(["up1"]) == {"up1": "a.zip"}
+    assert asked("up1") == 2
 
 
 @responses.activate(registry=registries.OrderedRegistry)

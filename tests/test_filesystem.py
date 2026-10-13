@@ -15,7 +15,7 @@ API = f"{BASE}/api/v1"
 @pytest.fixture(autouse=True)
 def list_folder_by_folder(monkeypatch):
     # these tests are about NOMAD's own folder listing; test_zip.py covers listing from the ZIP
-    monkeypatch.setattr(NomadFileSystem, "_zip_tree", lambda self, upload_id, public: None)
+    monkeypatch.setattr(NomadFileSystem, "_zip_tree", lambda self, upload_id: None)
 
 
 def make_fs() -> NomadFileSystem:

@@ -1,6 +1,7 @@
 """Read the file list of a remote ZIP from its central directory in one or two ranged reads."""
 
 import struct
+from array import array
 from collections.abc import Callable
 
 # the end record is at most this far from the end, behind a comment of up to 65,535 bytes
@@ -10,14 +11,17 @@ TAIL = 2 << 20
 
 # reads a byte range such as "bytes=-100" or "bytes=0-99"; returns the bytes and the ZIP's size
 Fetch = Callable[[str], tuple[bytes, int]]
+# each folder ("" is the top) holds its children's names, NUL-separated UTF-8, and their sizes,
+# -1 for a folder: one bytes object and one array per folder instead of objects per file
+Tree = dict[str, tuple[bytes, array]]
 
 
 class ZipIndexError(Exception):
     """The ZIP could not be read."""
 
 
-def list_files(fetch: Fetch, max_directory: int) -> dict[str, int | None]:
-    """Map each path in the ZIP to its size, or to None for a folder without files.
+def read_tree(fetch: Fetch, max_directory: int) -> Tree:
+    """Read the folders and files of a ZIP.
 
     A central directory larger than ``max_directory`` bytes is refused rather than read.
     """
@@ -44,15 +48,42 @@ def list_files(fetch: Fetch, max_directory: int) -> dict[str, int | None]:
         directory = tail[offset - base : offset - base + size]
     else:
         directory = fetch(f"bytes={offset}-{offset + size - 1}")[0]
-    files = _parse(directory)
-    if len(files) > count:
-        raise ZipIndexError("more entries than the end record counts")
-    return files
+    return _parse(directory, count)
 
 
-def _parse(directory: bytes) -> dict[str, int | None]:
-    files: dict[str, int | None] = {}
-    pos = 0
+def children(tree: Tree, folder: str) -> list[tuple[str, int | None]] | None:
+    """The children of a folder by name, with their sizes or None for folders; None if missing."""
+    kept = tree.get(folder)
+    if kept is None:
+        return None
+    raw, sizes = kept
+    named = dict(zip(raw.decode().split("\0")[:-1], sizes, strict=True))
+    return sorted((name, None if size < 0 else size) for name, size in named.items())
+
+
+def size_of(tree: Tree) -> int:
+    """Roughly the bytes a tree takes in memory."""
+    return sum(len(raw) + sizes.itemsize * len(sizes) + 200 for raw, sizes in tree.values())
+
+
+def _parse(directory: bytes, count: int) -> Tree:
+    names: dict[str, bytearray] = {"": bytearray()}
+    sizes: dict[str, array] = {"": array("q")}
+
+    def add(folder: str, name: str, size: int) -> None:
+        names[folder] += name.encode() + b"\0"
+        sizes[folder].append(size)
+
+    def link(folder: str) -> None:
+        # adds a folder and any missing parents, each listed once in its parent
+        if folder in names:
+            return
+        parent, _, name = folder.rpartition("/")
+        link(parent)
+        names[folder], sizes[folder] = bytearray(), array("q")
+        add(parent, name, -1)
+
+    pos = records = 0
     while pos + 46 <= len(directory):
         if directory[pos : pos + 4] != b"PK\x01\x02":
             raise ZipIndexError("broken central directory")
@@ -68,9 +99,17 @@ def _parse(directory: bytes) -> dict[str, int | None]:
         parts = [part for part in name.split("/") if part]
         # a ZIP may name a path outside itself; such entries are left out
         if parts and not any(part in (".", "..") for part in parts):
-            files["/".join(parts)] = None if name.endswith("/") else size
+            if name.endswith("/"):
+                link("/".join(parts))
+            else:
+                folder = "/".join(parts[:-1])
+                link(folder)
+                add(folder, parts[-1], size)
+        records += 1
         pos = start + name_length + extra_length + comment_length
-    return files
+    if records > count:
+        raise ZipIndexError("more entries than the end record counts")
+    return {folder: (bytes(names[folder]), sizes[folder]) for folder in names}
 
 
 def _zip64_size(extra: bytes) -> int:

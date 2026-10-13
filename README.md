@@ -32,12 +32,14 @@ fs = fsspec.filesystem("nomad", token="...")
 fs.ls("/uploads")  # your uploads, with their names in display_name
 ```
 
-A published upload is listed from the central directory of its ZIP, which takes one or two byte
-ranges of `/uploads/<upload id>/raw` without the token, even for uploads with hundreds of thousands of
-files. The listing is kept for the life of the process and shared, since published uploads do not
-change, up to 500,000 files in all (about 50 MB), the oldest dropped first. NOMAD's own folder listing adds up every size below a folder, which can take a minute on a
-large upload, so it is only used for uploads without a public ZIP: unpublished or under embargo.
-NOMAD allows one connection to that ZIP route per client every 5 seconds; a busy answer is retried.
+A published upload with more than 300 entries is listed from the central directory of its ZIP,
+which takes one or two byte ranges of `/uploads/<upload id>/raw` without the token, even for
+uploads with hundreds of thousands of files. NOMAD's own folder listing adds up every size below a
+folder and can take a minute on such uploads. The listing is kept for the life of the process and
+shared, since published uploads do not change: about 19 bytes per file, so 7 MB for the largest
+public upload, and up to 64 MB in all, the oldest dropped first. Smaller, unpublished and embargoed
+uploads are listed folder by folder. NOMAD allows one new connection to the ZIP route per client
+every 5 seconds; a busy answer is retried.
 
 A [personal access token](https://docs.nomad-lab.eu/howto/manage/program/auth.html) with the
 `uploads:read` scope is enough. To use a NOMAD Oasis, pass `base_url`:

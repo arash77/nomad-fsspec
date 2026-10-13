@@ -14,7 +14,7 @@ from fsspec.utils import isfilelike
 
 from .client import DEFAULT_BASE_URL, NomadClient, RangeUnavailable
 from .errors import NomadError
-from .zipindex import ZipIndexError, list_files
+from .zipindex import Tree, ZipIndexError, children, read_tree, size_of
 
 # NOMAD reads a whole directory for every page, so ask for all of it at once
 PAGE_SIZE = 10000
@@ -26,16 +26,17 @@ MAX_NAMES = 10000
 CHUNK_SIZE = 2**20
 DATASETS = "datasets"
 UPLOADS = "uploads"
-# files kept from the ZIPs of published uploads, across all of them: about 105 bytes each, so
-# about 50 MB, which still holds the largest public upload on nomad-lab.eu (394,495 files, 41 MB)
-MAX_ZIP_FILES = 500_000
+# smaller uploads list quickly folder by folder, and every ZIP read waits its turn: NOMAD allows
+# one every 5 seconds per client
+ZIP_MIN_ENTRIES = 300
+# memory for the file lists kept from ZIPs, across all uploads; the largest public upload on
+# nomad-lab.eu (394,495 files) takes about 10 MB
+MAX_ZIP_BYTES = 64 << 20
 # the largest public upload on nomad-lab.eu has a central directory of 34 MB
 MAX_ZIP_DIRECTORY = 128 << 20
 # how long the shared list of public datasets is kept when listings do not expire
 SHARED_DATASETS_SECONDS = 300
 
-# folders of an upload ("" is its top), each mapped to its children: a size, or None for a folder
-Tree = dict[str, dict[str, int | None]]
 # published uploads never change and their ZIPs are read without a token, so instances share them
 _zip_trees: OrderedDict[tuple[str, str], tuple[Tree, int]] = OrderedDict()
 # the public datasets are asked for as owner "public" whatever the token, so instances share them
@@ -256,8 +257,7 @@ class NomadFileSystem(AbstractFileSystem):
             ]
         located = self._locate(path)
         if located is not None:
-            # uploads with public data are published
-            return self._list_upload_directory(path, *located, public=parts[0] == DATASETS)
+            return self._list_upload_directory(path, *located)
         if parts == [DATASETS]:
             return self._list_datasets()
         if parts == [UPLOADS]:
@@ -319,9 +319,9 @@ class NomadFileSystem(AbstractFileSystem):
                 return
 
     def _list_upload_directory(
-        self, path: str, upload_id: str, inner: list[str], public: bool
+        self, path: str, upload_id: str, inner: list[str]
     ) -> list[dict[str, Any]]:
-        tree = self._zip_tree(upload_id, public)
+        tree = self._zip_tree(upload_id)
         if tree is not None:
             return _from_tree(tree, path, inner)
         entries: list[dict[str, Any]] = []
@@ -348,20 +348,20 @@ class NomadFileSystem(AbstractFileSystem):
             if not content or offset >= body["pagination"]["total"]:
                 return entries
 
-    def _zip_tree(self, upload_id: str, public: bool) -> Tree | None:
-        """The files of a published upload from its ZIP, or None to list it folder by folder."""
+    def _zip_tree(self, upload_id: str) -> Tree | None:
+        """The files of a large published upload from its ZIP, or None to list it by folder."""
         key = (self.client.api_url, upload_id)
         with _shared_lock:
             kept = _zip_trees.get(key)
             if kept is not None:
                 _zip_trees.move_to_end(key)
                 return kept[0]
-        if upload_id in self._no_zip or not (public or self._is_public(upload_id)):
+        if upload_id in self._no_zip or not self._wants_zip(upload_id):
             self._no_zip.add(upload_id)
             return None
         parts = ["uploads", upload_id, "raw"]
         try:
-            files = list_files(
+            tree = read_tree(
                 lambda byte_range: self.client.read_range(parts, byte_range), MAX_ZIP_DIRECTORY
             )
         except RangeUnavailable as e:
@@ -372,23 +372,24 @@ class NomadFileSystem(AbstractFileSystem):
         except ZipIndexError:
             self._no_zip.add(upload_id)
             return None
-        tree = _tree(files)
-        if len(files) <= MAX_ZIP_FILES:
+        size = size_of(tree)
+        if size <= MAX_ZIP_BYTES:
             with _shared_lock:
-                _zip_trees[key] = (tree, len(files))
-                kept_files = sum(count for _, count in _zip_trees.values())
-                while kept_files > MAX_ZIP_FILES:
-                    _, (_, count) = _zip_trees.popitem(last=False)
-                    kept_files -= count
+                _zip_trees[key] = (tree, size)
+                in_use = sum(kept_size for _, kept_size in _zip_trees.values())
+                while in_use > MAX_ZIP_BYTES:
+                    _, (_, dropped) = _zip_trees.popitem(last=False)
+                    in_use -= dropped
         return tree
 
-    def _is_public(self, upload_id: str) -> bool:
+    def _wants_zip(self, upload_id: str) -> bool:
         # only a published upload without an embargo has a ZIP that anyone may read
         try:
             upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
         except (NomadError, OSError):
             return False
-        return bool(upload.get("published")) and not upload.get("with_embargo")
+        public = bool(upload.get("published")) and not upload.get("with_embargo")
+        return public and (upload.get("entries") or 0) > ZIP_MIN_ENTRIES
 
     def _aggregate(self, quantity: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         buckets: list[dict[str, Any]] = []
@@ -424,29 +425,12 @@ def _split(path: str) -> list[str]:
     return parts
 
 
-def _tree(files: dict[str, int | None]) -> Tree:
-    tree: Tree = {"": {}}
-    for path, size in files.items():
-        if size is None:
-            tree.setdefault(path, {})
-        parent, _, name = path.rpartition("/")
-        tree.setdefault(parent, {})[name] = size
-        while parent:
-            grandparent, _, folder = parent.rpartition("/")
-            children = tree.setdefault(grandparent, {})
-            if folder in children:
-                break
-            children[folder] = None
-            parent = grandparent
-    return tree
-
-
 def _from_tree(tree: Tree, path: str, inner: list[str]) -> list[dict[str, Any]]:
     folder = "/".join(inner)
-    children = tree.get(folder)
-    if children is None:
+    listed = children(tree, folder)
+    if listed is None:
         parent, _, name = folder.rpartition("/")
-        size = tree.get(parent, {}).get(name)
+        size = dict(children(tree, parent) or []).get(name)
         if size is None:
             raise FileNotFoundError(path)
         return [{"name": path, "size": size, "type": "file"}]
@@ -456,7 +440,7 @@ def _from_tree(tree: Tree, path: str, inner: list[str]) -> list[dict[str, Any]]:
             "size": size or 0,
             "type": "directory" if size is None else "file",
         }
-        for name, size in sorted(children.items())
+        for name, size in listed
     ]
 
 

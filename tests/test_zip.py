@@ -6,7 +6,7 @@ import zipfile
 import pytest
 import responses
 
-from nomad_fsspec import NomadFileSystem, zipindex
+from nomad_fsspec import NomadFileSystem, filesystem, zipindex
 
 BASE = "https://nomad.example.org/oasis"
 API = f"{BASE}/api/v1"
@@ -23,7 +23,14 @@ def make_zip(files: dict[str, bytes], folders: tuple[str, ...] = ()) -> bytes:
     return buffer.getvalue()
 
 
+def large_upload(upload: str, **extra) -> None:
+    data = {"published": True, "entries": filesystem.ZIP_MIN_ENTRIES + 1, **extra}
+    responses.get(f"{API}/uploads/{upload}", json={"data": data})
+
+
 def serve_zip(data: bytes, seen: list[dict]) -> None:
+    large_upload("up1")
+
     def ranged(request):
         seen.append(dict(request.headers))
         start, end = re.fullmatch(r"bytes=(\d*)-(\d*)", request.headers["Range"]).groups()
@@ -75,13 +82,16 @@ def test_a_large_zip64_directory_takes_a_second_read(monkeypatch):
 
 
 @responses.activate
-def test_an_upload_without_a_public_zip_is_listed_folder_by_folder():
-    responses.get(f"{API}/uploads/up1", json={"data": {"published": False}})
+def test_small_unpublished_or_unreadable_uploads_are_listed_folder_by_folder():
+    large_upload("up1", published=False)
+    large_upload("up2")
     responses.get(f"{API}/uploads/up2/raw", status=401, json={"detail": "embargoed"})
+    large_upload("up3")
     responses.get(
         f"{API}/uploads/up3/raw", status=429, headers={"Retry-After": "0"}, json={"detail": "busy"}
     )
-    for upload in ("up1", "up2", "up3"):
+    responses.get(f"{API}/uploads/up4", json={"data": {"published": True, "entries": 3}})
+    for upload in ("up1", "up2", "up3", "up4"):
         responses.get(
             f"{API}/uploads/{upload}/rawdir/",
             json={
@@ -91,11 +101,12 @@ def test_an_upload_without_a_public_zip_is_listed_folder_by_folder():
         )
     fs = NomadFileSystem(base_url=BASE, skip_instance_cache=True)
     assert fs.ls("/uploads/up1", detail=False) == ["/uploads/up1/a"]
+    assert fs.ls("/datasets/ds1/up4", detail=False) == ["/datasets/ds1/up4/a"]
 
     def zip_reads(upload):
         return sum(call.request.url == f"{API}/uploads/{upload}/raw" for call in responses.calls)
 
-    assert zip_reads("up1") == 0
+    assert zip_reads("up1") == zip_reads("up4") == 0
     for upload in ("up2", "up3"):
         assert fs.ls(f"/datasets/ds1/{upload}", detail=False) == [f"/datasets/ds1/{upload}/a"]
     before = zip_reads("up2"), zip_reads("up3")
@@ -108,6 +119,7 @@ def test_an_upload_without_a_public_zip_is_listed_folder_by_folder():
 
 @responses.activate
 def test_a_server_that_ignores_the_range_is_not_read():
+    large_upload("up1")
     responses.get(ZIP_URL, body=make_zip({"a.txt": b"abc"}))
     responses.get(
         f"{API}/uploads/up1/rawdir/",
@@ -136,11 +148,18 @@ def test_names_paths_and_zip64_sizes_are_read_from_the_directory():
             directory_record(b"big.bin", 0xFFFFFFFF, extra=struct.pack("<HHQ", 0x0001, 8, 5 << 32)),
             directory_record(b"../outside.txt", 3),
             directory_record(b"folder/", 0),
+            directory_record(b"a/b/c.txt", 4),
         ]
     )
-    assert zipindex._parse(directory) == {
-        "é.txt": 1,
-        "ét.txt": 2,
-        "big.bin": 5 << 32,
-        "folder": None,
-    }
+    tree = zipindex._parse(directory, 6)
+    assert zipindex.children(tree, "") == [
+        ("a", None),
+        ("big.bin", 5 << 32),
+        ("folder", None),
+        ("é.txt", 1),
+        ("ét.txt", 2),
+    ]
+    assert zipindex.children(tree, "a") == [("b", None)]
+    assert zipindex.children(tree, "a/b") == [("c.txt", 4)]
+    assert zipindex.children(tree, "folder") == []
+    assert zipindex.children(tree, "gone") is None

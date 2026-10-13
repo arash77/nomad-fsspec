@@ -50,10 +50,12 @@ def test_my_uploads_reads_a_published_upload_and_refuses_a_bad_token(fs):
         bad.ls("/uploads")
 
 
-def test_a_published_upload_lists_the_same_from_its_zip_as_folder_by_folder(fs, monkeypatch):
+def test_a_large_upload_lists_the_same_from_its_zip_as_folder_by_folder(fs, monkeypatch):
+    # 3,103 entries: listed from the ZIP, while NOMAD's own listing of its top times out
+    upload = "/datasets/dPJ22G1XSyOaasDQhTt7Cw/-2YZM_gjQrW-yKPNT0kM6w"
+    folders = [e["name"] for e in fs.ls(upload)[:2]]
     by_folder = NomadFileSystem(skip_instance_cache=True)
-    monkeypatch.setattr(by_folder, "_zip_tree", lambda upload_id, public: None)
-    upload = DEMO_FILE.rsplit("/nomad-demo-data/", 1)[0]
-    for folder in (upload, f"{upload}/nomad-demo-data", DEMO_FILE.rsplit("/", 1)[0]):
+    monkeypatch.setattr(by_folder, "_zip_tree", lambda upload_id: None)
+    for folder in folders:
         listed = {(e["name"], e["type"], e["size"]) for e in fs.ls(folder)}
         assert listed == {(e["name"], e["type"], e["size"]) for e in by_folder.ls(folder)}

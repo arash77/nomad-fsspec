@@ -1,6 +1,7 @@
 import io
 import re
 import struct
+import time
 import zipfile
 
 import pytest
@@ -122,6 +123,29 @@ def test_small_unpublished_or_unreadable_uploads_are_listed_folder_by_folder():
     # a missing ZIP is not asked for again, but a busy NOMAD is
     assert zip_reads("up2") == before[0] == 1
     assert zip_reads("up3") > before[1]
+
+
+@responses.activate
+def test_an_upload_nomad_failed_to_describe_is_asked_about_again_later(monkeypatch):
+    responses.get(f"{API}/uploads/up1", status=500, json={"detail": "try again"})
+    seen: list[dict] = []
+    serve_zip(make_zip({"a.txt": b"abc"}), seen)
+    responses.get(
+        f"{API}/uploads/up1/rawdir/",
+        json={
+            "directory_metadata": {"content": [{"name": "a.txt", "is_file": True, "size": 3}]},
+            "pagination": {"total": 1},
+        },
+    )
+    fs = NomadFileSystem(base_url=BASE, skip_instance_cache=True)
+    for _ in range(2):
+        assert fs.ls("/datasets/ds1/up1", detail=False, refresh=True) == ["/datasets/ds1/up1/a.txt"]
+    assert not seen
+    assert sum(call.request.url == f"{API}/uploads/up1" for call in responses.calls) == 1
+    later = time.monotonic() + filesystem.ASK_AGAIN_SECONDS + 1
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    assert fs.ls("/datasets/ds1/up1", detail=False, refresh=True) == ["/datasets/ds1/up1/a.txt"]
+    assert len(seen) == 1
 
 
 @responses.activate

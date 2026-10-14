@@ -67,6 +67,9 @@ class NomadClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         if token:
+            if "\r" in token or "\n" in token:
+                # requests would refuse the header and quote the token in its error
+                raise ValueError("The NOMAD token has a line break; check that it was copied whole")
             self.session.headers["Authorization"] = f"Bearer {token}"
 
     def url(self, parts: list[str]) -> str:

@@ -34,6 +34,12 @@ def test_path_segments_are_encoded_one_at_a_time():
     assert url == f"{API}/uploads/u1/raw/run%20%231%20100%25.csv/"
 
 
+def test_a_token_with_a_line_break_is_refused_without_showing_it():
+    with pytest.raises(ValueError, match="line break") as refused:
+        NomadClient(API, token="abc\ndef")
+    assert "abc" not in str(refused.value)
+
+
 @responses.activate
 def test_errors_are_mapped():
     client = NomadClient(API)

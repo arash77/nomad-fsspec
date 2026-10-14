@@ -194,7 +194,7 @@ def test_a_token_lists_the_uploads_of_its_user_and_reads_them():
         json=rawdir({"name": "a.txt", "size": 3, "is_file": True}),
     )
     responses.get(f"{API}/uploads/up1/raw/a.txt", match=[auth], body=b"abc")
-    fs = NomadFileSystem(base_url=BASE, token="my-token", skip_instance_cache=True)
+    fs = NomadFileSystem(base_url=BASE, token="my-token\n", skip_instance_cache=True)
     assert [(e["name"], e["display_name"]) for e in fs.ls("/uploads")] == [
         ("/uploads/up1", "Alpha"),
         ("/uploads/up2", "beta"),

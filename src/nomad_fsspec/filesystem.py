@@ -40,6 +40,8 @@ MAX_ZIP_BYTES = 64 << 20
 MAX_ZIP_DIRECTORY = 128 << 20
 # how long the shared list of public datasets is kept when listings do not expire
 SHARED_DATASETS_SECONDS = 300
+# how long an upload NOMAD failed to describe is listed folder by folder before it is asked again
+ASK_AGAIN_SECONDS = 60
 
 # published uploads never change and their ZIPs are read without a token, so instances share them
 _zip_trees: OrderedDict[tuple[str, str], tuple[Tree, int]] = OrderedDict()
@@ -78,11 +80,13 @@ class NomadFileSystem(AbstractFileSystem):
     ) -> None:
         super().__init__(**storage_options)
         self.dircache = _Listings(**storage_options)
+        token = (token or "").strip() or None
         self.client = NomadClient(base_url, timeout, token)
         self._has_token = bool(token)
         self._upload_names: dict[str, str | None] = {}
         self._no_zip: set[str] = set()
         self._small: set[str] = set()
+        self._unanswered: dict[str, float] = {}
 
     @classmethod
     def _strip_protocol(cls, path: Any) -> Any:
@@ -111,6 +115,7 @@ class NomadFileSystem(AbstractFileSystem):
             self._upload_names.clear()
             self._no_zip.clear()
             self._small.clear()
+            self._unanswered.clear()
             with _shared_lock:
                 for key in [key for key in _zip_trees if key[0] == self.client.api_url]:
                     del _zip_trees[key]
@@ -386,7 +391,14 @@ class NomadFileSystem(AbstractFileSystem):
         if upload_id in self._no_zip:
             return None
         if upload_id not in self._small:
-            public, entries = self._upload_facts(upload_id)
+            if time.monotonic() < self._unanswered.get(upload_id, 0):
+                return None
+            facts = self._upload_facts(upload_id)
+            if facts is None:
+                self._unanswered[upload_id] = time.monotonic() + ASK_AGAIN_SECONDS
+                return None
+            self._unanswered.pop(upload_id, None)
+            public, entries = facts
             if not public:
                 self._no_zip.add(upload_id)
                 return None
@@ -426,13 +438,18 @@ class NomadFileSystem(AbstractFileSystem):
             _zip_trees.move_to_end(key)
             return kept[0]
 
-    def _upload_facts(self, upload_id: str) -> tuple[bool, int]:
-        """Whether anyone may read the upload's ZIP, and its number of entries."""
+    def _upload_facts(self, upload_id: str) -> tuple[bool, int] | None:
+        """Whether anyone may read the upload's ZIP, and its number of entries.
+
+        None when NOMAD did not answer, so that the upload is asked about again later.
+        """
         # only a published upload without an embargo has a ZIP that anyone may read
         try:
             upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
-        except (NomadError, OSError):
+        except (FileNotFoundError, PermissionError):
             return False, 0
+        except (NomadError, OSError):
+            return None
         public = bool(upload.get("published")) and not upload.get("with_embargo")
         return public, int(upload.get("entries") or 0)
 

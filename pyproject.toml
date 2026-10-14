@@ -31,8 +31,8 @@ dependencies = [
 nomad = "nomad_fsspec:NomadFileSystem"
 
 [project.urls]
-Homepage = "https://github.com/arash77/nomad-fsspec"
-Issues = "https://github.com/arash77/nomad-fsspec/issues"
+Homepage = "https://github.com/usegalaxy-eu/nomad-fsspec"
+Issues = "https://github.com/usegalaxy-eu/nomad-fsspec/issues"
 
 [dependency-groups]
 dev = [

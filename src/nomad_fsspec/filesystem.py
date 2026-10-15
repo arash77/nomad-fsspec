@@ -39,8 +39,8 @@ MAX_ZIP_BYTES = 64 << 20
 # the largest public upload on nomad-lab.eu has a central directory of 34 MB
 MAX_ZIP_DIRECTORY = 128 << 20
 # how long the shared listings of public datasets are kept when listings do not expire
-SHARED_DATASETS_SECONDS = 300
-# entries kept in shared listings, about 360 bytes each, so 18 MB; the oldest listing goes first
+SHARED_LISTINGS_SECONDS = 300
+# entries kept in shared listings, about 360 bytes each, so 18 MB; the least used listing goes first
 MAX_SHARED_ENTRIES = 50000
 # how long an upload NOMAD failed to describe is listed folder by folder before it is asked again
 ASK_AGAIN_SECONDS = 60
@@ -104,6 +104,8 @@ class NomadFileSystem(AbstractFileSystem):
         path = self._strip_protocol(path)
         # not _ls_from_cache: it answers a folder with its own entry once the parent is cached
         key = path.rstrip("/")
+        if refresh:
+            self._forget_shared(key)
         entries = None if refresh else self.dircache.get(key)
         if entries is None:
             with _named(path):
@@ -126,7 +128,9 @@ class NomadFileSystem(AbstractFileSystem):
                     for key in [key for key in shared if key[0] == self.client.api_url]:
                         del shared[key]
         else:
-            self.dircache.pop(self._strip_protocol(path).rstrip("/"), None)
+            key = self._strip_protocol(path).rstrip("/")
+            self.dircache.pop(key, None)
+            self._forget_shared(key)
 
     def get_file(
         self,
@@ -317,23 +321,31 @@ class NomadFileSystem(AbstractFileSystem):
     def _shared(self, path: str, fetch: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
         """A public listing, kept for every instance; each thread has its own instance."""
         share = self.dircache.use_listings_cache
-        lifetime = self.dircache.listings_expiry_time or SHARED_DATASETS_SECONDS
+        lifetime = self.dircache.listings_expiry_time or SHARED_LISTINGS_SECONDS
         key = (self.client.api_url, path)
         if share:
             with _shared_lock:
                 kept = _shared_listings.get(key)
-            if kept is not None and time.monotonic() - kept[0] < lifetime:
-                return list(kept[1])
+                if kept is not None and time.monotonic() - kept[0] < lifetime:
+                    _shared_listings.move_to_end(key)
+                    return list(kept[1])
         listing = fetch()
         if share:
             with _shared_lock:
-                _shared_listings.pop(key, None)
-                _shared_listings[key] = (time.monotonic(), listing)
+                now = time.monotonic()
+                for old, (stored, _) in list(_shared_listings.items()):
+                    if old == key or now - stored >= lifetime:
+                        del _shared_listings[old]
+                _shared_listings[key] = (now, listing)
                 in_use = sum(len(held[1]) for held in _shared_listings.values())
                 while in_use > MAX_SHARED_ENTRIES and len(_shared_listings) > 1:
                     _, (_, dropped) = _shared_listings.popitem(last=False)
                     in_use -= len(dropped)
         return list(listing)
+
+    def _forget_shared(self, path: str) -> None:
+        with _shared_lock:
+            _shared_listings.pop((self.client.api_url, path), None)
 
     def _list_datasets(self) -> list[dict[str, Any]]:
         # costs a second or two

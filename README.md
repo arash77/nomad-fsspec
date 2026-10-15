@@ -45,8 +45,11 @@ every 5 seconds; a busy answer is retried.
 
 The public datasets and the uploads of each dataset are the same with or without a token, so every
 instance in the process shares these listings, for `listings_expiry_time` or 5 minutes, up to
-50,000 entries in all. The name and number of entries of a published upload without an embargo
-are shared too, so a new instance, such as one for each token, does not ask for them again.
+50,000 entries in all; `ls(path, refresh=True)` and `invalidate_cache(path)` ask NOMAD again. The
+name and number of entries of a published upload without an embargo are shared too, so a new
+instance, such as one for each token, does not ask for them again. Like the ZIP listings, they are
+kept for the life of the process, up to 10,000 uploads: an upload an administrator renames or
+removes later keeps its old name until then, or until `invalidate_cache()`.
 
 Other listings are kept by each instance in fsspec's listing cache, where `max_paths` and
 `listings_expiry_time` drop old listings as new ones come in. fsspec's own cache drops them only

@@ -3,7 +3,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import IO, Any
@@ -38,15 +38,20 @@ QUICK_LISTING_SECONDS = 5
 MAX_ZIP_BYTES = 64 << 20
 # the largest public upload on nomad-lab.eu has a central directory of 34 MB
 MAX_ZIP_DIRECTORY = 128 << 20
-# how long the shared list of public datasets is kept when listings do not expire
+# how long the shared listings of public datasets are kept when listings do not expire
 SHARED_DATASETS_SECONDS = 300
+# entries kept in shared listings, about 360 bytes each, so 18 MB; the oldest listing goes first
+MAX_SHARED_ENTRIES = 50000
 # how long an upload NOMAD failed to describe is listed folder by folder before it is asked again
 ASK_AGAIN_SECONDS = 60
 
 # published uploads never change and their ZIPs are read without a token, so instances share them
 _zip_trees: OrderedDict[tuple[str, str], tuple[Tree, int]] = OrderedDict()
-# the public datasets are asked for as owner "public" whatever the token, so instances share them
-_shared_datasets: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+# public datasets and their uploads are asked for as owner "public" whatever the token, so
+# instances share these listings
+_shared_listings: OrderedDict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = OrderedDict()
+# the name and number of entries of published uploads without an embargo, the same for everyone
+_public_uploads: OrderedDict[tuple[str, str], tuple[str | None, int]] = OrderedDict()
 _shared_lock = threading.Lock()
 
 
@@ -117,9 +122,9 @@ class NomadFileSystem(AbstractFileSystem):
             self._small.clear()
             self._unanswered.clear()
             with _shared_lock:
-                for key in [key for key in _zip_trees if key[0] == self.client.api_url]:
-                    del _zip_trees[key]
-                _shared_datasets.pop(self.client.api_url, None)
+                for shared in (_zip_trees, _shared_listings, _public_uploads):
+                    for key in [key for key in shared if key[0] == self.client.api_url]:
+                        del shared[key]
         else:
             self.dircache.pop(self._strip_protocol(path).rstrip("/"), None)
 
@@ -201,6 +206,9 @@ class NomadFileSystem(AbstractFileSystem):
         wanted = list(dict.fromkeys(upload_ids))
         if len(self._upload_names) > MAX_NAMES:
             self._upload_names.clear()
+        for upload_id in wanted:
+            if upload_id not in self._upload_names and (kept := self._public_upload(upload_id)):
+                self._upload_names[upload_id] = kept[0]
         missing = [upload_id for upload_id in wanted if upload_id not in self._upload_names]
         if missing:
             with ThreadPoolExecutor(min(NAMES_WORKERS, len(missing))) as pool:
@@ -215,10 +223,32 @@ class NomadFileSystem(AbstractFileSystem):
 
     def _upload_name(self, upload_id: str) -> tuple[bool, str | None]:
         try:
-            upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
+            upload = self._upload(upload_id)
         except (NomadError, OSError):
             return False, None
         return True, upload.get("upload_name")
+
+    def _upload(self, upload_id: str) -> dict[str, Any]:
+        """NOMAD's description of an upload; a public one is kept for every instance."""
+        upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
+        # NOMAD always sends with_embargo; only an upload without one is the same for everyone
+        if upload.get("published") and not upload.get("with_embargo"):
+            key = (self.client.api_url, upload_id)
+            with _shared_lock:
+                _public_uploads[key] = (upload.get("upload_name"), int(upload.get("entries") or 0))
+                _public_uploads.move_to_end(key)
+                while len(_public_uploads) > MAX_NAMES:
+                    _public_uploads.popitem(last=False)
+        return upload
+
+    def _public_upload(self, upload_id: str) -> tuple[str | None, int] | None:
+        """The name and number of entries of a public upload, if an instance asked about it."""
+        key = (self.client.api_url, upload_id)
+        with _shared_lock:
+            kept = _public_uploads.get(key)
+            if kept is not None:
+                _public_uploads.move_to_end(key)
+            return kept
 
     def search_uploads(self, dataset_id: str, text: str) -> list[str]:
         """Find the public uploads of a dataset whose name contains ``text``, ignoring case.
@@ -284,28 +314,41 @@ class NomadFileSystem(AbstractFileSystem):
             return self._list_own_uploads()
         return self._list_dataset_uploads(parts[1])
 
-    def _list_datasets(self) -> list[dict[str, Any]]:
-        # each thread has its own instance, so its own listings; this one costs a second or two
+    def _shared(self, path: str, fetch: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        """A public listing, kept for every instance; each thread has its own instance."""
         share = self.dircache.use_listings_cache
         lifetime = self.dircache.listings_expiry_time or SHARED_DATASETS_SECONDS
+        key = (self.client.api_url, path)
         if share:
             with _shared_lock:
-                kept = _shared_datasets.get(self.client.api_url)
+                kept = _shared_listings.get(key)
             if kept is not None and time.monotonic() - kept[0] < lifetime:
                 return list(kept[1])
+        listing = fetch()
+        if share:
+            with _shared_lock:
+                _shared_listings.pop(key, None)
+                _shared_listings[key] = (time.monotonic(), listing)
+                in_use = sum(len(held[1]) for held in _shared_listings.values())
+                while in_use > MAX_SHARED_ENTRIES and len(_shared_listings) > 1:
+                    _, (_, dropped) = _shared_listings.popitem(last=False)
+                    in_use -= len(dropped)
+        return list(listing)
+
+    def _list_datasets(self) -> list[dict[str, Any]]:
+        # costs a second or two
+        return self._shared(f"/{DATASETS}", self._fetch_datasets)
+
+    def _fetch_datasets(self) -> list[dict[str, Any]]:
         public = {bucket["value"] for bucket in self._aggregate("datasets.dataset_id", {})}
         params = {"order_by": "dataset_name", "order": "asc"}
-        datasets = _by_name(
+        return _by_name(
             [
                 _directory(f"/{DATASETS}/{dataset['dataset_id']}", dataset.get("dataset_name"))
                 for dataset in self._pages(["datasets", ""], params)
                 if dataset["dataset_id"] in public
             ]
         )
-        if share:
-            with _shared_lock:
-                _shared_datasets[self.client.api_url] = (time.monotonic(), datasets)
-        return list(datasets)
 
     def _list_own_uploads(self) -> list[dict[str, Any]]:
         if not self._has_token:
@@ -318,6 +361,11 @@ class NomadFileSystem(AbstractFileSystem):
         )
 
     def _list_dataset_uploads(self, dataset_id: str) -> list[dict[str, Any]]:
+        return self._shared(
+            f"/{DATASETS}/{dataset_id}", lambda: self._fetch_dataset_uploads(dataset_id)
+        )
+
+    def _fetch_dataset_uploads(self, dataset_id: str) -> list[dict[str, Any]]:
         # ids only: naming all uploads of a large dataset at once makes NOMAD time out
         buckets = self._aggregate("upload_id", {"datasets.dataset_id": dataset_id})
         if not buckets:
@@ -443,9 +491,12 @@ class NomadFileSystem(AbstractFileSystem):
 
         None when NOMAD did not answer, so that the upload is asked about again later.
         """
+        kept = self._public_upload(upload_id)
+        if kept is not None:
+            return True, kept[1]
         # only a published upload without an embargo has a ZIP that anyone may read
         try:
-            upload = self.client.get_json(["uploads", upload_id]).get("data") or {}
+            upload = self._upload(upload_id)
         except (FileNotFoundError, PermissionError):
             return False, 0
         except (NomadError, OSError):

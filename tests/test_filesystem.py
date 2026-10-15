@@ -107,6 +107,66 @@ def test_instances_share_the_public_datasets_unless_listings_are_not_kept():
     assert len(responses.calls) == 6
 
 
+@responses.activate
+def test_instances_share_the_uploads_of_a_dataset_whatever_the_token():
+    responses.post(f"{API}/entries/query", json=aggregation("up1"))
+    for token in (None, "my-token"):
+        fs = NomadFileSystem(base_url=BASE, token=token, skip_instance_cache=True)
+        assert fs.ls("/datasets/ds1", detail=False) == ["/datasets/ds1/up1"]
+    assert len(responses.calls) == 1
+    # asking for fresh data reaches NOMAD again, for this instance and the others
+    fs.ls("/datasets/ds1", refresh=True)
+    fs.invalidate_cache("/datasets/ds1")
+    make_fs().ls("/datasets/ds1")
+    assert len(responses.calls) == 3
+
+
+@responses.activate
+def test_shared_listings_past_the_limit_drop_the_least_used(monkeypatch):
+    monkeypatch.setattr(filesystem, "MAX_SHARED_ENTRIES", 3)
+
+    def dataset(dataset_id, *uploads):
+        query = {"datasets.dataset_id": dataset_id}
+        body = aggregation_body("upload_id", query, 2500)
+        responses.post(
+            f"{API}/entries/query",
+            match=[matchers.json_params_matcher(body)],
+            json=aggregation(*uploads),
+        )
+        make_fs().ls(f"/datasets/{dataset_id}")
+
+    def kept():
+        return [path for _, path in filesystem._shared_listings]
+
+    dataset("ds1", "up1")
+    dataset("ds2", "up2")
+    make_fs().ls("/datasets/ds1")
+    dataset("ds3", "up3", "up4")
+    assert kept() == ["/datasets/ds1", "/datasets/ds3"]
+    # a listing over the limit by itself is still kept, alone
+    dataset("ds4", "up5", "up6", "up7", "up8")
+    assert kept() == ["/datasets/ds4"]
+
+
+@responses.activate
+def test_instances_share_only_what_they_learn_about_public_uploads():
+    public = {"upload_name": "a.zip", "published": True, "with_embargo": False, "entries": 3}
+    responses.get(f"{API}/uploads/up1", json={"data": public})
+    draft = {**public, "upload_name": "draft", "published": False}
+    responses.get(f"{API}/uploads/up2", json={"data": draft})
+    embargoed = {**public, "upload_name": "embargoed", "with_embargo": True}
+    responses.get(f"{API}/uploads/up3", json={"data": embargoed})
+    mine = NomadFileSystem(base_url=BASE, token="my-token", skip_instance_cache=True)
+    names = {"up1": "a.zip", "up2": "draft", "up3": "embargoed"}
+    assert mine.upload_names(["up1", "up2", "up3"]) == names
+    other = make_fs()
+    assert other.upload_names(["up1"]) == {"up1": "a.zip"}
+    assert other._upload_facts("up1") == (True, 3)
+    assert len(responses.calls) == 3
+    other.upload_names(["up2", "up3"])
+    assert len(responses.calls) == 5
+
+
 @responses.activate(registry=registries.OrderedRegistry)
 def test_a_dataset_lists_its_uploads_by_id_across_pages(monkeypatch):
     monkeypatch.setattr(filesystem, "AGGREGATION_PAGE_SIZE", 2)
